@@ -1,0 +1,30 @@
+# AFAD Project Task List
+
+- [x] 環境構築
+    - [x] `venv` の作成と有効化 <!-- id: 0 -->
+    - [x] プロジェクトディレクトリ構造の作成 <!-- id: 1 -->
+    - [x] `requirements.txt` の作成とインストール <!-- id: 2 -->
+    - [x] `config/afad_config.yaml` の作成 <!-- id: 3 -->
+- [x] 基盤実装 (Week 1-2)
+    - [x] `src/utils/` (Logger, Config Loader) の実装 <!-- id: 4 -->
+    - [x] `src/models/registry.py` (ModelRegistry) の実装 <!-- id: 5 -->
+    - [x] `src/data/mnist_loader.py` の実装 <!-- id: 6 -->
+    - [x] `src/server/afad_server.py` の雛形作成 <!-- id: 7 -->
+    - [x] `src/client/afad_client.py` の雛形作成 <!-- id: 8 -->
+- [x] コアアルゴリズム実装 (Week 3-4)
+    - [x] `src/routing/family_router.py` の実装 <!-- id: 9 -->
+    - [x] `src/models/cnn/` (ResNet, MobileNet) の実装 <!-- id: 10 -->
+    - [x] `src/models/vit/` (ViT, DeiT) の実装 <!-- id: 11 -->
+    - [x] `src/server/generator/synthetic_generator.py` の実装 <!-- id: 12 -->
+    - [x] `src/server/strategy/afad_strategy.py` の実装 <!-- id: 13 -->
+    - [x] `src/server/strategy/heterofl_aggregator.py` の実装 <!-- id: 14 -->
+    - [x] `src/server/strategy/fedgen_distiller.py` の実装 <!-- id: 15 -->
+- [x] 検証・デバッグ (Week 5-6)
+    - [x] 単体テスト (`tests/`) の作成 <!-- id: 16 -->
+    - [x] 統合テスト (Simulation with Flower) <!-- id: 17 -->
+- [x] バージョン管理
+    - [x] `.gitignore` の作成 <!-- id: 18 -->
+    - [x] ローカルリポジトリの初期化とコミット <!-- id: 19 -->
+    - [x] GitHubへのプッシュ (Remote URL設定) <!-- id: 20 -->
+- [ ] ドキュメント作成
+    - [x] `README.md` の作成 <!-- id: 21 -->
