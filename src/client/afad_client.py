@@ -18,6 +18,7 @@ class AFADClient(fl.client.NumPyClient):
         self.epochs = epochs
         self.device = torch.device(device)
         self.model.to(self.device)
+        logger.info(f"Client {cid} initialized on device: {self.device}")
         
     def get_parameters(self, config):
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
@@ -44,19 +45,25 @@ class AFADClient(fl.client.NumPyClient):
         """
         Local training loop
         """
+        from tqdm import tqdm
+        
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
         self.model.train()
         
         for epoch in range(self.epochs):
-            for images, labels in self.train_loader:
-                images, labels = images.to(self.device), labels.to(self.device)
-                
-                optimizer.zero_grad()
-                outputs = self.model(images)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
+            # Add tqdm for progress tracking
+            with tqdm(self.train_loader, unit="batch", desc=f"Client {self.cid} Epoch {epoch+1}/{self.epochs}") as tepoch:
+                for images, labels in tepoch:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    
+                    optimizer.zero_grad()
+                    outputs = self.model(images)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    tepoch.set_postfix(loss=loss.item())
                 
     def fit(self, parameters, config):
         # logger.info(f"Client {self.cid}: fit()")

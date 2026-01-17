@@ -23,7 +23,11 @@ import src.models.vit.deit
 
 logger = setup_logger("AFADExperiment")
 
-CLIENT_RESOURCES = {"num_cpus": 1.0, "num_gpus": 0.0} # Set GPU to 0 for safety in this env or use if available
+# Check for GPU availability
+device_type = "cuda" if torch.cuda.is_available() else "cpu"
+# Allocate 15% of GPU per client to allow ~6 clients in parallel on one GPU
+num_gpus = 0.15 if device_type == "cuda" else 0.0
+CLIENT_RESOURCES = {"num_cpus": 1.0, "num_gpus": num_gpus}
 
 def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -44,6 +48,12 @@ def client_fn_builder(train_loaders, config):
     }
 
     def client_fn(cid: str) -> fl.client.Client:
+        # Import models here to ensure registration in Ray workers
+        import src.models.cnn.resnet
+        import src.models.cnn.mobilenet
+        import src.models.vit.vit
+        import src.models.vit.deit
+
         model_name = cid_to_model.get(cid, "resnet18")
         device = get_device()
         

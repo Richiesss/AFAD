@@ -16,98 +16,117 @@ class HeteroFLAggregator:
         global_params: List[np.ndarray]
     ) -> Parameters:
         """
-        同族内の結果を集約する
+        Aggregate parameters within a family using HeteroFL logic (finding max shape).
         
         Args:
-            family: ファミリー名
+            family: Family name
             results: List of (parameters_ndarray, num_examples)
             global_params: Current global parameters for this family
             
         Returns:
             Parameters: Updated global parameters
         """
-        # HeteroFL: 単純平均ではなく、パラメータが存在する部分だけの平均を取る
-        # AFADの仕様では "チャンネル数に基づく選択的平均化"
-        # 実装簡易化のため、パラメータサイズが一致する場合は単純な加重平均を行い、
-        # サイズが異なる（部分モデル）の場合は、大きいモデル（Global）の対応部分に加算して平均化する。
-        # しかしPyTorchのstate_dict順序に依存するため、本来は名前ベースのマッピングが必要。
-        # FlowerのParametersはただのByte列のリストなので、名前情報がない。
-        # ★重要: 実用的にはAFADClientがFull Modelと同じ形状のUpdate（他は0埋め）を送るか、
-        # あるいはServer側でParameterの名前管理が必要。
-        # HeteroFL論文では "sub-model parameters are updated..."
+        # 1. Determine maximum shape for each layer across global and all clients
+        # Initialize max_shapes with global_params shapes
+        max_shapes = [p.shape for p in global_params]
         
-        # 今回の実装方針:
-        # Clientは「自身のモデルパラメータ」そのものを送る。
-        # Serverは「最大のモデル」の形状を知っている必要がある（global_params）。
-        # しかし、List[ndarray]だけではどの層がどれか分からない。
-        # 簡易実装として: "Weight Padding" 方式を採用するか、
-        # クライアント側で "Full Model" の形状にパディングして送るのが一番簡単。
-        # ここでは、AFADClientが「自分のパラメータ」を送ってくる前提で、
-        # 配列の形状が一致するもの同士を集約する「Best Effort」な実装にする。
-        # ※本来ならModelRegistryを使って構造を把握すべき。
+        # Check against all client results
+        for client_params, _ in results:
+            # Extend max_shapes list if client has more layers (though unusual for HeteroFL)
+            if len(client_params) > len(max_shapes):
+                for _ in range(len(client_params) - len(max_shapes)):
+                    max_shapes.append(client_params[len(max_shapes)].shape)
+            
+            for i, p in enumerate(client_params):
+                current_max = max_shapes[i]
+                # Compare dimensions
+                if len(p.shape) != len(current_max):
+                    # Different rank (e.g. Conv2d vs Linear flattened?), rare if arch is consistent.
+                    # If this happens, likely incompatible architectures mixed (ResNet vs MLP).
+                    # We keep the one with more dimensions or just current global?
+                    # For safety, we trust the one with LARGER volume or just keep current max if rank matches.
+                    pass 
+                else:
+                    new_shape = tuple(max(d1, d2) for d1, d2 in zip(current_max, p.shape))
+                    max_shapes[i] = new_shape
+
+        # 2. Create accumulators
+        weighted_sum = [np.zeros(shape) for shape in max_shapes]
+        weights_count = [np.zeros(shape) for shape in max_shapes]
         
-        # 単純なFedAvg (Weighted Average) を、各レイヤーごとに行う
-        # レイヤー数が異なると破綻するため、Family内ではレイヤー数は同一（幅だけ違う）前提。
-        # ResNet18/34/50はレイヤー数が違うので混在は難しい -> FamilyDefinitionで分けるべきか？
-        # 仕様書: "CNN Family (ResNet50, 34, 18, MobileNet)"
-        # これらを混ぜて平均するのは構造的に不可能（ResNet50はBottleneck, 18はBasicBlock）。
-        # HeteroFLは「同じアーキテクチャで幅（チャネル数）が違う」ものを扱う。
-        # AFAD仕様書の "同族間重み共有" は、構造が一致する部分（あるいは特定レイヤー）のみを共有するか、
-        # 「ResNet Family」の中でさらに「ResNet50-Half」のようなサブセットを想定している可能性が高い。
-        # しかし仕様書には "ResNet50, 34, 18" と異なる深さのモデルが混在している。
-        # F-002: "チャンネル数に基づく選択的平均化" -> これはHeteroFLの定義通り。
-        # 深さが違うモデル間の共有はHeteroFLの範囲外（それはKnowledge Distillationでやるべき）。
-        # よって、AFAD戦略としては:
-        # 1. 完全に構造が一致する（幅違い含む）サブグループごとに集約 (Strict HeteroFL)
-        # 2. 構造が違うものは集約しない（個別学習に近い）
-        # 3. あるいは共通部分（最初のConvなど）だけ共有
-        
-        # 実装:
-        # レイヤー数が一致するグループごとに集約する。
-        # shapeが一致するレイヤーは平均、不一致なら集約しない（Globalを維持、あるいは更新なし）。
-        
-        # 重み付き平均の累積用
-        weighted_weights = [np.zeros_like(p) for p in global_params]
-        total_weights = [0.0 for _ in global_params] # カウント（または重み総和）
-        
+        # 3. Aggregate
         for client_params, num_examples in results:
             for i, p in enumerate(client_params):
-                if i >= len(weighted_weights):
-                    break # Globalより多いレイヤーは無視
+                if i >= len(weighted_sum):
+                   break
                 
-                # 形状チェック
-                g_p = weighted_weights[i]
-                if p.shape == g_p.shape:
-                    # 完全一致: 単純加算
-                    weighted_weights[i] += p * num_examples
-                    total_weights[i] += num_examples
-                else:
-                    # 部分一致 (HeteroFL logic): スライシング
-                    # Conv2d: (Out, In, H, W) -> Out, In を合わせる
-                    # 単純化: 左上のスライスのみ対応
-                    slices = tuple(slice(0, d) for d in p.shape)
-                    weighted_weights[i][slices] += p * num_examples
-                    
-                    # カウント行列が必要だが、簡易的にスカラで割るとおかしくなる。
-                    # 正確にはパラメータごとのカウンタが必要
-                    # TODO: 本格実装は複雑すぎるため、Phase 1では
-                    # 「同じモデルアーキテクチャ（ResNet18同士など）」のみを集約し、
-                    # 異なるアーキテクチャ間はFedGen（蒸留）のみで知識共有する方針に倒すのが安全。
-                    # 仕様書にも "同族（HeteroFL）" とあるが、ResNet18と50を同族としてパディング集約するのは無理がある。
-                    # FamilyRouterの実装では "resnet" で一括りだが、ここではモデル名ごとに集約を分けるか、
-                    # あるいは "ResNet18" と "ResNet18-Half" のような関係のみをHeteroFL対象とする。
-                    
-                    # 修正方針:
-                    # 形状が完全一致するもののみ平均する (FedAvg equivalent for same arch).
-                    pass
+                # Determine slice for this client's params
+                # Assuming top-left alignment (standard HeteroFL)
+                # Handle potential rank mismatch by skipping or reshaping? 
+                # AFAD assumes same architecture (e.g. ResNet) but different widths.
+                # Rank should match.
+                
+                target_shape = weighted_sum[i].shape
+                src_shape = p.shape
+                
+                if len(target_shape) != len(src_shape):
+                    # Skip incompatible layers (e.g. FC mismatch caused by Flatten size diff)
+                    continue
 
-        # 平均化
-        new_params = []
-        for i, (w_sum, total) in enumerate(zip(weighted_weights, total_weights)):
-            if total > 0:
-                new_params.append(w_sum / total)
-            else:
-                # 誰も更新しなかったパラメータはGlobalのまま
-                new_params.append(global_params[i])
+                slices = tuple(slice(0, d) for d in src_shape)
                 
+                # Ensure we fit in target (max_shapes guarantees this, but safety check)
+                valid = True
+                for s, t in zip(src_shape, target_shape):
+                    if s > t: valid = False
+                
+                if valid:
+                    weighted_sum[i][slices] += p * num_examples
+                    weights_count[i][slices] += num_examples
+
+        # 4. Average
+        new_params = []
+        for w_sum, count, original_global in zip(weighted_sum, weights_count, global_params + [None]*(len(weighted_sum)-len(global_params))):
+            # Avoid divide by zero
+            # Where count > 0, we update. Where count == 0, we can keep original global or 0.
+            # HeteroFL: Un-updated parameters should conceptually track global state.
+            # If we extended global_params, original is None/smaller.
+            
+            updated = np.zeros_like(w_sum)
+            mask = count > 0
+            
+            # Update where we have data
+            updated[mask] = w_sum[mask] / count[mask]
+            
+            # Where no data from clients:
+            # If we have original global value, keep it.
+            if original_global is not None:
+                # Need to copy original global into the new larger shape if needed
+                # (Slicing logic)
+                src_shape = original_global.shape
+                target_shape = updated.shape
+                
+                if len(src_shape) == len(target_shape):
+                     slices = tuple(slice(0, d) for d in src_shape)
+                     # Only fill if mask is False (no update)? 
+                     # Or does Global decay? Standard FL keeps old value.
+                     # We blend: updated[~mask] = original[~mask] (roughly)
+                     
+                     # Extract original values for non-updated regions
+                     # But 'updated' shape might be larger than 'original'.
+                     # We need to map original into 'updated' buffer.
+                     
+                     # Strategy: Initialize 'final' with expanded original, then overwrite with updates?
+                     # No, HeteroFL says global parameter is the union.
+                     # We should preserve previous global values if valid.
+                     
+                     # Let's simple copy original to a temp buffer
+                     temp_global = np.zeros_like(updated)
+                     temp_global[slices] = original_global
+                     
+                     # Fill gaps
+                     updated[~mask] = temp_global[~mask]
+            
+            new_params.append(updated)
+
         return ndarrays_to_parameters(new_params)
