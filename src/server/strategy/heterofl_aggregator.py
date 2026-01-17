@@ -1,132 +1,316 @@
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import numpy as np
 from flwr.common import Parameters, ndarrays_to_parameters, parameters_to_ndarrays
 
+
 class HeteroFLAggregator:
     """
-    HeteroFL方式の同族内集約を行うクラス
+    HeteroFL方式の集約を行うクラス
+
+    参照実装: https://github.com/diaoenmao/HeteroFL-Computation-and-Communication-Efficient-Federated-Learning-for-Heterogeneous-Clients
+
+    主要な機能:
+    1. split_model: クライアントのmodel_rateに基づいてサブモデルのインデックスを計算
+    2. distribute: グローバルモデルからサブモデルを切り出してクライアントに配布
+    3. aggregate: クライアントからの更新を集約（更新回数ベース）
     """
-    def __init__(self):
-        pass
+
+    def __init__(self, global_model_rate: float = 1.0):
+        """
+        Args:
+            global_model_rate: グローバルモデルの基準レート（通常1.0）
+        """
+        self.global_model_rate = global_model_rate
+        # クライアントごとのパラメータインデックスを保持
+        self.client_param_idx: Dict[str, List[Tuple]] = {}
+
+    def compute_param_idx(
+        self,
+        global_params: List[np.ndarray],
+        model_rate: float
+    ) -> List[Tuple]:
+        """
+        クライアントのmodel_rateに基づいてパラメータインデックスを計算
+
+        HeteroFLでは、小さいサブモデルは大きいモデルの先頭部分を使用する
+
+        Args:
+            global_params: グローバルモデルのパラメータリスト
+            model_rate: クライアントのモデルレート（0.0〜1.0）
+                       例: 0.5 = グローバルの半分の幅
+
+        Returns:
+            各レイヤーのインデックスタプルのリスト
+        """
+        param_idx = []
+        scaler = model_rate / self.global_model_rate
+
+        # 前のレイヤーの出力インデックス（次のレイヤーの入力に使用）
+        prev_output_idx = None
+
+        for i, param in enumerate(global_params):
+            shape = param.shape
+
+            if len(shape) == 0:
+                # スカラー（例: BatchNormのnum_batches_tracked）
+                param_idx.append(())
+                continue
+
+            elif len(shape) == 1:
+                # 1次元（バイアス、BatchNormのweight/bias等）
+                # 前のレイヤーの出力サイズに合わせる
+                if prev_output_idx is not None:
+                    idx = prev_output_idx
+                else:
+                    output_size = int(np.ceil(shape[0] * scaler))
+                    idx = np.arange(output_size)
+                param_idx.append((idx,))
+
+            elif len(shape) == 2:
+                # 2次元（全結合層: [out_features, in_features]）
+                output_size = int(np.ceil(shape[0] * scaler))
+                output_idx = np.arange(output_size)
+
+                if prev_output_idx is not None:
+                    input_idx = prev_output_idx
+                else:
+                    input_size = int(np.ceil(shape[1] * scaler))
+                    input_idx = np.arange(input_size)
+
+                param_idx.append((output_idx, input_idx))
+                prev_output_idx = output_idx
+
+            elif len(shape) == 4:
+                # 4次元（Conv2d: [out_channels, in_channels, H, W]）
+                output_size = int(np.ceil(shape[0] * scaler))
+                output_idx = np.arange(output_size)
+
+                if prev_output_idx is not None:
+                    input_idx = prev_output_idx
+                else:
+                    input_size = int(np.ceil(shape[1] * scaler))
+                    input_idx = np.arange(input_size)
+
+                param_idx.append((output_idx, input_idx))
+                prev_output_idx = output_idx
+
+            else:
+                # その他の次元
+                scaled_shape = tuple(int(np.ceil(s * scaler)) for s in shape)
+                idx_tuple = tuple(np.arange(s) for s in scaled_shape)
+                param_idx.append(idx_tuple)
+                if len(shape) > 0:
+                    prev_output_idx = np.arange(scaled_shape[0])
+
+        return param_idx
+
+    def distribute(
+        self,
+        global_params: List[np.ndarray],
+        client_id: str,
+        model_rate: float
+    ) -> List[np.ndarray]:
+        """
+        グローバルモデルからクライアント用のサブモデルを切り出す
+
+        Args:
+            global_params: グローバルモデルのパラメータリスト
+            client_id: クライアントID
+            model_rate: クライアントのモデルレート
+
+        Returns:
+            サブモデルのパラメータリスト
+        """
+        # インデックスを計算して保存
+        param_idx = self.compute_param_idx(global_params, model_rate)
+        self.client_param_idx[client_id] = param_idx
+
+        # サブモデルを切り出す
+        sub_params = []
+        for i, (param, idx) in enumerate(zip(global_params, param_idx)):
+            if len(idx) == 0:
+                # スカラー
+                sub_params.append(param.copy())
+            elif len(idx) == 1:
+                # 1次元（バイアス等）- スライスで切り出し
+                size = len(idx[0])
+                sub_params.append(param[:size].copy())
+            elif len(idx) == 2:
+                out_size = len(idx[0])
+                in_size = len(idx[1])
+                if len(param.shape) == 2:
+                    # 2次元（全結合層: [out, in]）
+                    sub_params.append(param[:out_size, :in_size].copy())
+                elif len(param.shape) == 4:
+                    # 4次元（Conv2d: [out, in, H, W]）
+                    sub_params.append(param[:out_size, :in_size, :, :].copy())
+                else:
+                    sub_params.append(param.copy())
+            else:
+                # その他
+                sub_params.append(param.copy())
+
+        return sub_params
 
     def aggregate(
-        self, 
-        family: str, 
-        results: List[Tuple[np.ndarray, int]], 
+        self,
+        family: str,
+        results: List[Tuple[str, np.ndarray, int]],  # (client_id, params, num_examples)
         global_params: List[np.ndarray]
     ) -> Parameters:
         """
-        Aggregate parameters within a family using HeteroFL logic (finding max shape).
-        
-        Args:
-            family: Family name
-            results: List of (parameters_ndarray, num_examples)
-            global_params: Current global parameters for this family
-            
-        Returns:
-            Parameters: Updated global parameters
-        """
-        # 1. Determine maximum shape for each layer across global and all clients
-        # Initialize max_shapes with global_params shapes
-        max_shapes = [p.shape for p in global_params]
-        
-        # Check against all client results
-        for client_params, _ in results:
-            # Extend max_shapes list if client has more layers (though unusual for HeteroFL)
-            if len(client_params) > len(max_shapes):
-                for _ in range(len(client_params) - len(max_shapes)):
-                    max_shapes.append(client_params[len(max_shapes)].shape)
-            
-            for i, p in enumerate(client_params):
-                current_max = max_shapes[i]
-                # Compare dimensions
-                if len(p.shape) != len(current_max):
-                    # Different rank (e.g. Conv2d vs Linear flattened?), rare if arch is consistent.
-                    # If this happens, likely incompatible architectures mixed (ResNet vs MLP).
-                    # We keep the one with more dimensions or just current global?
-                    # For safety, we trust the one with LARGER volume or just keep current max if rank matches.
-                    pass 
-                else:
-                    new_shape = tuple(max(d1, d2) for d1, d2 in zip(current_max, p.shape))
-                    max_shapes[i] = new_shape
+        HeteroFLの集約ロジック
 
-        # 2. Create accumulators
-        weighted_sum = [np.zeros(shape) for shape in max_shapes]
-        weights_count = [np.zeros(shape) for shape in max_shapes]
-        
-        # 3. Aggregate
+        参照実装のcombineメソッドに基づく:
+        - 各位置の更新回数をカウント（サンプル数ではない）
+        - 更新があった位置のみ平均化
+        - 更新がなかった位置は元のグローバル値を保持
+
+        Args:
+            family: ファミリー名
+            results: [(client_id, parameters_ndarray, num_examples), ...]
+            global_params: 現在のグローバルパラメータ
+
+        Returns:
+            Parameters: 更新されたグローバルパラメータ
+        """
+        if not results:
+            return ndarrays_to_parameters(global_params)
+
+        # 累積値とカウント用のバッファを初期化
+        accumulated = [np.zeros_like(p) for p in global_params]
+        count = [np.zeros_like(p) for p in global_params]
+
+        for client_id, client_params, num_examples in results:
+            # クライアントのインデックスを取得
+            param_idx = self.client_param_idx.get(client_id)
+
+            if param_idx is None:
+                # インデックスがない場合は形状ベースで推定（後方互換性）
+                param_idx = self._infer_param_idx(client_params, global_params)
+
+            for i, (local_param, idx) in enumerate(zip(client_params, param_idx)):
+                if i >= len(accumulated):
+                    break
+
+                if len(idx) == 0:
+                    # スカラー
+                    accumulated[i] += local_param
+                    count[i] += 1
+                elif len(idx) == 1:
+                    # 1次元 - スライスで処理
+                    size = len(idx[0])
+                    accumulated[i][:size] += local_param
+                    count[i][:size] += 1
+                elif len(idx) == 2:
+                    out_size = len(idx[0])
+                    in_size = len(idx[1])
+                    if len(global_params[i].shape) == 2:
+                        # 2次元（全結合層）- スライスで処理
+                        accumulated[i][:out_size, :in_size] += local_param
+                        count[i][:out_size, :in_size] += 1
+                    elif len(global_params[i].shape) == 4:
+                        # 4次元（Conv2d）- スライスで処理
+                        accumulated[i][:out_size, :in_size, :, :] += local_param
+                        count[i][:out_size, :in_size, :, :] += 1
+                    else:
+                        # フォールバック: スライスベース
+                        slices = tuple(slice(0, len(ix)) for ix in idx)
+                        accumulated[i][slices] += local_param
+                        count[i][slices] += 1
+
+        # 平均化
+        new_params = []
+        for acc, cnt, orig in zip(accumulated, count, global_params):
+            updated = orig.copy()
+            mask = cnt > 0
+            if np.any(mask):
+                updated[mask] = acc[mask] / cnt[mask]
+            new_params.append(updated)
+
+        return ndarrays_to_parameters(new_params)
+
+    def _infer_param_idx(
+        self,
+        client_params: List[np.ndarray],
+        global_params: List[np.ndarray]
+    ) -> List[Tuple]:
+        """
+        クライアントパラメータの形状からインデックスを推定（後方互換性用）
+
+        Args:
+            client_params: クライアントのパラメータ
+            global_params: グローバルパラメータ
+
+        Returns:
+            推定されたインデックスリスト
+        """
+        param_idx = []
+        for client_p, global_p in zip(client_params, global_params):
+            if client_p.shape == global_p.shape:
+                # 同じ形状 - フルモデル
+                idx = tuple(np.arange(s) for s in client_p.shape)
+            else:
+                # 異なる形状 - サブモデル
+                idx = tuple(np.arange(s) for s in client_p.shape)
+            param_idx.append(idx)
+        return param_idx
+
+    def aggregate_simple(
+        self,
+        family: str,
+        results: List[Tuple[np.ndarray, int]],
+        global_params: List[np.ndarray]
+    ) -> Parameters:
+        """
+        シンプルな集約（client_idなしの後方互換性用）
+
+        インデックス追跡なしで、形状ベースのスライスで集約
+
+        Args:
+            family: ファミリー名
+            results: [(parameters_ndarray, num_examples), ...]
+            global_params: 現在のグローバルパラメータ
+
+        Returns:
+            Parameters: 更新されたグローバルパラメータ
+        """
+        if not results:
+            return ndarrays_to_parameters(global_params)
+
+        # 累積値とカウント用のバッファを初期化
+        accumulated = [np.zeros_like(p) for p in global_params]
+        count = [np.zeros_like(p) for p in global_params]
+
         for client_params, num_examples in results:
             for i, p in enumerate(client_params):
-                if i >= len(weighted_sum):
-                   break
-                
-                # Determine slice for this client's params
-                # Assuming top-left alignment (standard HeteroFL)
-                # Handle potential rank mismatch by skipping or reshaping? 
-                # AFAD assumes same architecture (e.g. ResNet) but different widths.
-                # Rank should match.
-                
-                target_shape = weighted_sum[i].shape
+                if i >= len(accumulated):
+                    break
+
+                target_shape = accumulated[i].shape
                 src_shape = p.shape
-                
+
                 if len(target_shape) != len(src_shape):
-                    # Skip incompatible layers (e.g. FC mismatch caused by Flatten size diff)
+                    continue
+
+                # 各次元でサイズが収まるか確認
+                valid = all(s <= t for s, t in zip(src_shape, target_shape))
+                if not valid:
                     continue
 
                 slices = tuple(slice(0, d) for d in src_shape)
-                
-                # Ensure we fit in target (max_shapes guarantees this, but safety check)
-                valid = True
-                for s, t in zip(src_shape, target_shape):
-                    if s > t: valid = False
-                
-                if valid:
-                    weighted_sum[i][slices] += p * num_examples
-                    weights_count[i][slices] += num_examples
 
-        # 4. Average
+                # 更新回数でカウント（サンプル数ではない）
+                accumulated[i][slices] += p
+                count[i][slices] += 1
+
+        # 平均化
         new_params = []
-        for w_sum, count, original_global in zip(weighted_sum, weights_count, global_params + [None]*(len(weighted_sum)-len(global_params))):
-            # Avoid divide by zero
-            # Where count > 0, we update. Where count == 0, we can keep original global or 0.
-            # HeteroFL: Un-updated parameters should conceptually track global state.
-            # If we extended global_params, original is None/smaller.
-            
-            updated = np.zeros_like(w_sum)
-            mask = count > 0
-            
-            # Update where we have data
-            updated[mask] = w_sum[mask] / count[mask]
-            
-            # Where no data from clients:
-            # If we have original global value, keep it.
-            if original_global is not None:
-                # Need to copy original global into the new larger shape if needed
-                # (Slicing logic)
-                src_shape = original_global.shape
-                target_shape = updated.shape
-                
-                if len(src_shape) == len(target_shape):
-                     slices = tuple(slice(0, d) for d in src_shape)
-                     # Only fill if mask is False (no update)? 
-                     # Or does Global decay? Standard FL keeps old value.
-                     # We blend: updated[~mask] = original[~mask] (roughly)
-                     
-                     # Extract original values for non-updated regions
-                     # But 'updated' shape might be larger than 'original'.
-                     # We need to map original into 'updated' buffer.
-                     
-                     # Strategy: Initialize 'final' with expanded original, then overwrite with updates?
-                     # No, HeteroFL says global parameter is the union.
-                     # We should preserve previous global values if valid.
-                     
-                     # Let's simple copy original to a temp buffer
-                     temp_global = np.zeros_like(updated)
-                     temp_global[slices] = original_global
-                     
-                     # Fill gaps
-                     updated[~mask] = temp_global[~mask]
-            
+        for acc, cnt, orig in zip(accumulated, count, global_params):
+            updated = orig.copy()
+            mask = cnt > 0
+            if np.any(mask):
+                updated[mask] = acc[mask] / cnt[mask]
             new_params.append(updated)
 
         return ndarrays_to_parameters(new_params)

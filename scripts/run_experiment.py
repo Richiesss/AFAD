@@ -47,6 +47,16 @@ def client_fn_builder(train_loaders, config):
         "4": "deit_small"
     }
 
+    # Map CID to Family for HeteroFL aggregation
+    # HeteroFL only works within the same architecture family
+    cid_to_family = {
+        "0": "cnn",      # ResNet50
+        "1": "cnn",      # MobileNetV3
+        "2": "cnn",      # ResNet18
+        "3": "vit",      # ViT
+        "4": "vit"       # DeiT
+    }
+
     def client_fn(cid: str) -> fl.client.Client:
         # Import models here to ensure registration in Ray workers
         import src.models.cnn.resnet
@@ -55,22 +65,24 @@ def client_fn_builder(train_loaders, config):
         import src.models.vit.deit
 
         model_name = cid_to_model.get(cid, "resnet18")
+        family = cid_to_family.get(cid, "cnn")
         device = get_device()
-        
+
         # Create Model
         model = ModelRegistry.create_model(model_name, num_classes=10)
-        
+
         # Get Loader
         client_id_int = int(cid)
         train_loader = train_loaders[client_id_int % len(train_loaders)]
-        
-        # Create Client
+
+        # Create Client with family information
         return AFADClient(
             cid=cid,
             model=model,
             train_loader=train_loader,
             epochs=config['training']['local_epochs'],
-            device=device
+            device=device,
+            family=family
         ).to_client()
 
     return client_fn
