@@ -17,6 +17,9 @@ venv/
 .vscode/
 *.swp
 *.swo
+.claude/
+.codex/
+.gemini/
 
 # Project specific
 data/

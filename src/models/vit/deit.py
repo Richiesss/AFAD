@@ -6,6 +6,7 @@ from src.models.vit.vit import _create_vit
 # Phase 1では簡略化してViTと同じアーキテクチャでパラメータ規模を調整したものとして実装します。
 # 必要であれば後でtimmのDeiTをラップするように変更します。
 
+
 @ModelRegistry.register("deit_tiny", family="deit", complexity=0.06)
 def create_deit_tiny(num_classes: int = 10, **kwargs):
     # DeiT-Tiny is basically ViT-Tiny
@@ -16,8 +17,9 @@ def create_deit_tiny(num_classes: int = 10, **kwargs):
         num_layers=12,
         num_heads=3,
         hidden_dim=192,
-        mlp_dim=192*4
+        mlp_dim=192 * 4,
     )
+
 
 @ModelRegistry.register("deit_small", family="deit", complexity=0.26)
 def create_deit_small(num_classes: int = 10, **kwargs):
@@ -29,5 +31,5 @@ def create_deit_small(num_classes: int = 10, **kwargs):
         num_layers=12,
         num_heads=6,
         hidden_dim=384,
-        mlp_dim=384*4
+        mlp_dim=384 * 4,
     )

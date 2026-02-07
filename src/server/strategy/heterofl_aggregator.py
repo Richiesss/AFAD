@@ -1,6 +1,5 @@
-from typing import List, Tuple, Dict, Optional
 import numpy as np
-from flwr.common import Parameters, ndarrays_to_parameters, parameters_to_ndarrays
+from flwr.common import Parameters, ndarrays_to_parameters
 
 
 class HeteroFLAggregator:
@@ -22,13 +21,11 @@ class HeteroFLAggregator:
         """
         self.global_model_rate = global_model_rate
         # クライアントごとのパラメータインデックスを保持
-        self.client_param_idx: Dict[str, List[Tuple]] = {}
+        self.client_param_idx: dict[str, list[tuple]] = {}
 
     def compute_param_idx(
-        self,
-        global_params: List[np.ndarray],
-        model_rate: float
-    ) -> List[Tuple]:
+        self, global_params: list[np.ndarray], model_rate: float
+    ) -> list[tuple]:
         """
         クライアントのmodel_rateに基づいてパラメータインデックスを計算
 
@@ -105,11 +102,8 @@ class HeteroFLAggregator:
         return param_idx
 
     def distribute(
-        self,
-        global_params: List[np.ndarray],
-        client_id: str,
-        model_rate: float
-    ) -> List[np.ndarray]:
+        self, global_params: list[np.ndarray], client_id: str, model_rate: float
+    ) -> list[np.ndarray]:
         """
         グローバルモデルからクライアント用のサブモデルを切り出す
 
@@ -155,8 +149,8 @@ class HeteroFLAggregator:
     def aggregate(
         self,
         family: str,
-        results: List[Tuple[str, np.ndarray, int]],  # (client_id, params, num_examples)
-        global_params: List[np.ndarray]
+        results: list[tuple[str, np.ndarray, int]],  # (client_id, params, num_examples)
+        global_params: list[np.ndarray],
     ) -> Parameters:
         """
         HeteroFLの集約ロジック
@@ -231,10 +225,8 @@ class HeteroFLAggregator:
         return ndarrays_to_parameters(new_params)
 
     def _infer_param_idx(
-        self,
-        client_params: List[np.ndarray],
-        global_params: List[np.ndarray]
-    ) -> List[Tuple]:
+        self, client_params: list[np.ndarray], global_params: list[np.ndarray]
+    ) -> list[tuple]:
         """
         クライアントパラメータの形状からインデックスを推定（後方互換性用）
 
@@ -259,8 +251,8 @@ class HeteroFLAggregator:
     def aggregate_simple(
         self,
         family: str,
-        results: List[Tuple[np.ndarray, int]],
-        global_params: List[np.ndarray]
+        results: list[tuple[np.ndarray, int]],
+        global_params: list[np.ndarray],
     ) -> Parameters:
         """
         シンプルな集約（client_idなしの後方互換性用）

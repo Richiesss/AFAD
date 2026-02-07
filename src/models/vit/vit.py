@@ -1,8 +1,8 @@
-import torch
 import torch.nn as nn
 from torchvision.models.vision_transformer import VisionTransformer
-from functools import partial
+
 from src.models.registry import ModelRegistry
+
 
 def _create_vit(
     num_classes: int,
@@ -35,9 +35,10 @@ def _create_vit(
         out_channels=original_proj.out_channels,
         kernel_size=original_proj.kernel_size,
         stride=original_proj.stride,
-        bias=original_proj.bias is not None
+        bias=original_proj.bias is not None,
     )
     return model
+
 
 @ModelRegistry.register("vit_tiny", family="vit", complexity=0.06)
 def create_vit_tiny(num_classes: int = 10, **kwargs):
@@ -49,8 +50,9 @@ def create_vit_tiny(num_classes: int = 10, **kwargs):
         num_layers=12,
         num_heads=3,
         hidden_dim=192,
-        mlp_dim=192*4
+        mlp_dim=192 * 4,
     )
+
 
 @ModelRegistry.register("vit_small", family="vit", complexity=0.26)
 def create_vit_small(num_classes: int = 10, **kwargs):
@@ -62,5 +64,5 @@ def create_vit_small(num_classes: int = 10, **kwargs):
         num_layers=12,
         num_heads=6,
         hidden_dim=384,
-        mlp_dim=384*4
+        mlp_dim=384 * 4,
     )

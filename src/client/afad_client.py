@@ -1,10 +1,11 @@
+from collections import OrderedDict
+
 import flwr as fl
+import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple, Optional
+
 from src.utils.logger import setup_logger
-from collections import OrderedDict
-import numpy as np
 
 logger = setup_logger("AFADClient")
 
@@ -16,6 +17,7 @@ class AFADClient(fl.client.NumPyClient):
     Supports receiving sub-models based on model_rate and
     properly applying parameters for heterogeneous model widths.
     """
+
     def __init__(
         self,
         cid: str,
@@ -24,7 +26,7 @@ class AFADClient(fl.client.NumPyClient):
         epochs: int,
         device: str = "cpu",
         family: str = "default",
-        model_rate: float = 1.0
+        model_rate: float = 1.0,
     ):
         self.cid = cid
         self.model = model
@@ -35,14 +37,16 @@ class AFADClient(fl.client.NumPyClient):
         self.family = family
         self.model_rate = model_rate  # Client's model rate for HeteroFL
 
-        logger.info(f"Client {cid} initialized on device: {self.device}, "
-                   f"family: {family}, model_rate: {model_rate}")
+        logger.info(
+            f"Client {cid} initialized on device: {self.device}, "
+            f"family: {family}, model_rate: {model_rate}"
+        )
 
-    def get_parameters(self, config) -> List[np.ndarray]:
+    def get_parameters(self, config) -> list[np.ndarray]:
         """Return model parameters as a list of NumPy arrays"""
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
 
-    def set_parameters(self, parameters: List[np.ndarray], config: Dict = None):
+    def set_parameters(self, parameters: list[np.ndarray], config: dict = None):
         """
         Set model parameters from a list of NumPy arrays.
 
@@ -52,8 +56,10 @@ class AFADClient(fl.client.NumPyClient):
         model_keys = list(self.model.state_dict().keys())
 
         if len(parameters) != len(model_keys):
-            logger.warning(f"Client {self.cid}: Parameter count mismatch. "
-                          f"Received {len(parameters)}, model has {len(model_keys)}")
+            logger.warning(
+                f"Client {self.cid}: Parameter count mismatch. "
+                f"Received {len(parameters)}, model has {len(model_keys)}"
+            )
 
         state_dict = OrderedDict()
         for i, (key, param) in enumerate(zip(model_keys, parameters)):
@@ -66,29 +72,40 @@ class AFADClient(fl.client.NumPyClient):
             else:
                 # HeteroFL: received sub-model parameters
                 # Sub-model params are smaller and should be placed at the beginning
-                logger.debug(f"Client {self.cid}: Layer {key} shape mismatch. "
-                           f"Local: {local_shape}, Received: {received_shape}")
+                logger.debug(
+                    f"Client {self.cid}: Layer {key} shape mismatch. "
+                    f"Local: {local_shape}, Received: {received_shape}"
+                )
 
                 # Start with zeros (or could use current weights)
                 new_param = torch.zeros(local_shape)
 
                 # Copy received params to the beginning (top-left for multi-dim)
                 if len(local_shape) == 1:
-                    new_param[:received_shape[0]] = torch.tensor(param)
+                    new_param[: received_shape[0]] = torch.tensor(param)
                 elif len(local_shape) == 2:
-                    new_param[:received_shape[0], :received_shape[1]] = torch.tensor(param)
+                    new_param[: received_shape[0], : received_shape[1]] = torch.tensor(
+                        param
+                    )
                 elif len(local_shape) == 4:
-                    new_param[:received_shape[0], :received_shape[1], :, :] = torch.tensor(param)
+                    new_param[: received_shape[0], : received_shape[1], :, :] = (
+                        torch.tensor(param)
+                    )
                 else:
                     # Fallback: try to fit what we can
-                    slices = tuple(slice(0, min(l, r)) for l, r in zip(local_shape, received_shape))
+                    slices = tuple(
+                        slice(0, min(loc, rec))
+                        for loc, rec in zip(local_shape, received_shape)
+                    )
                     new_param[slices] = torch.tensor(param[slices])
 
                 state_dict[key] = new_param
 
         self.model.load_state_dict(state_dict, strict=False)
 
-    def fit(self, parameters: List[np.ndarray], config: Dict) -> Tuple[List[np.ndarray], int, Dict]:
+    def fit(
+        self, parameters: list[np.ndarray], config: dict
+    ) -> tuple[list[np.ndarray], int, dict]:
         """
         Train the model on local data.
 
@@ -125,8 +142,8 @@ class AFADClient(fl.client.NumPyClient):
             {
                 "family": self.family,
                 "model_rate": self.model_rate,
-                "client_id": self.cid
-            }
+                "client_id": self.cid,
+            },
         )
 
     def _train(self):
@@ -140,9 +157,12 @@ class AFADClient(fl.client.NumPyClient):
         self.model.train()
 
         for epoch in range(self.epochs):
-            with tqdm(self.train_loader, unit="batch",
-                     desc=f"Client {self.cid} Epoch {epoch+1}/{self.epochs}",
-                     leave=False) as tepoch:
+            with tqdm(
+                self.train_loader,
+                unit="batch",
+                desc=f"Client {self.cid} Epoch {epoch + 1}/{self.epochs}",
+                leave=False,
+            ) as tepoch:
                 for images, labels in tepoch:
                     images, labels = images.to(self.device), labels.to(self.device)
 
@@ -154,7 +174,9 @@ class AFADClient(fl.client.NumPyClient):
 
                     tepoch.set_postfix(loss=loss.item())
 
-    def evaluate(self, parameters: List[np.ndarray], config: Dict) -> Tuple[float, int, Dict]:
+    def evaluate(
+        self, parameters: list[np.ndarray], config: dict
+    ) -> tuple[float, int, dict]:
         """
         Evaluate the model on local data.
 
@@ -195,6 +217,6 @@ class AFADClient(fl.client.NumPyClient):
             {
                 "accuracy": accuracy,
                 "family": self.family,
-                "model_rate": self.model_rate
-            }
+                "model_rate": self.model_rate,
+            },
         )

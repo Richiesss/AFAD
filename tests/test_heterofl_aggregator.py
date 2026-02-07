@@ -7,8 +7,8 @@ Verifies that the implementation follows the reference HeteroFL paper:
 3. Proper index tracking for heterogeneous widths
 """
 
-import pytest
 import numpy as np
+import pytest
 from flwr.common import parameters_to_ndarrays
 
 from src.server.strategy.heterofl_aggregator import HeteroFLAggregator
@@ -24,7 +24,7 @@ class TestHeteroFLAggregator:
         # Simulate Conv layer [out_channels=64, in_channels=3, H=3, W=3]
         global_params = [
             np.random.randn(64, 3, 3, 3),  # Conv weight
-            np.random.randn(64),            # Conv bias
+            np.random.randn(64),  # Conv bias
         ]
 
         param_idx = aggregator.compute_param_idx(global_params, model_rate=1.0)
@@ -33,7 +33,7 @@ class TestHeteroFLAggregator:
         assert len(param_idx) == 2
         assert len(param_idx[0]) == 2  # (output_idx, input_idx)
         assert len(param_idx[0][0]) == 64  # All output channels
-        assert len(param_idx[0][1]) == 3   # All input channels
+        assert len(param_idx[0][1]) == 3  # All input channels
         assert len(param_idx[1]) == 1  # Bias has 1D index
         assert len(param_idx[1][0]) == 64  # All bias elements
 
@@ -43,7 +43,7 @@ class TestHeteroFLAggregator:
 
         global_params = [
             np.random.randn(64, 3, 3, 3),  # Conv weight
-            np.random.randn(64),            # Conv bias
+            np.random.randn(64),  # Conv bias
         ]
 
         param_idx = aggregator.compute_param_idx(global_params, model_rate=0.5)
@@ -51,7 +51,7 @@ class TestHeteroFLAggregator:
         # Half rate should include half the output channels
         assert len(param_idx[0][0]) == 32  # Half of 64
         # Input channels depend on previous layer, but first layer uses scaler
-        assert len(param_idx[0][1]) == 2   # ceil(3 * 0.5) = 2
+        assert len(param_idx[0][1]) == 2  # ceil(3 * 0.5) = 2
         assert len(param_idx[1][0]) == 32  # Bias follows output size
 
     def test_distribute_creates_submodel(self):
@@ -102,9 +102,9 @@ class TestHeteroFLAggregator:
 
         # Client updates with different sample counts
         results = [
-            ("c1", [np.ones(10) * 3.0], 100),   # value=3, samples=100
-            ("c2", [np.ones(10) * 6.0], 200),   # value=6, samples=200
-            ("c3", [np.ones(10) * 9.0], 300),   # value=9, samples=300
+            ("c1", [np.ones(10) * 3.0], 100),  # value=3, samples=100
+            ("c2", [np.ones(10) * 6.0], 200),  # value=6, samples=200
+            ("c3", [np.ones(10) * 9.0], 300),  # value=9, samples=300
         ]
 
         updated = parameters_to_ndarrays(
@@ -153,7 +153,7 @@ class TestHeteroFLAggregator:
 
         results = [
             ("c1", [np.ones(10) * 10.0], 100),  # Updates all 10 positions
-            ("c2", [np.ones(5) * 20.0], 100),   # Updates first 5 positions
+            ("c2", [np.ones(5) * 20.0], 100),  # Updates first 5 positions
         ]
 
         updated = parameters_to_ndarrays(

@@ -1,26 +1,27 @@
 import flwr as fl
-from typing import Dict, Optional, Tuple
-from logging import Logger
-from src.utils.logger import setup_logger
+
 from src.utils.config_loader import load_config
+from src.utils.logger import setup_logger
 
 logger = setup_logger("AFADServer")
 
+
 class AFADServer:
-    def __init__(self, config: Dict):
+    def __init__(self, config: dict):
         self.config = config
-        self.num_rounds = config['experiment']['num_rounds']
-        
+        self.num_rounds = config["experiment"]["num_rounds"]
+
     def start(self):
         logger.info("Starting AFAD Server...")
         # Strategy initialization (TODO)
-        strategy = fl.server.strategy.FedAvg() # Placeholder
-        
+        strategy = fl.server.strategy.FedAvg()  # Placeholder
+
         fl.server.start_server(
-            server_address=self.config['server']['address'],
+            server_address=self.config["server"]["address"],
             config=fl.server.ServerConfig(num_rounds=self.num_rounds),
-            strategy=strategy
+            strategy=strategy,
         )
+
 
 if __name__ == "__main__":
     # Test run
