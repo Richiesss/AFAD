@@ -2,98 +2,189 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.utils.logger import setup_logger
+
+logger = setup_logger("FedGenDistiller")
+
 
 class FedGenDistiller:
     """
-    FedGen/DFRD方式の異種間蒸留を行うクラス
+    FedGen-style inter-family knowledge distillation.
+
+    Two phases:
+    1. Generator Training: Train generator so synthetic data produces
+       consistent logits across the model ensemble.
+    2. Model Distillation: Use KD loss (KL divergence with temperature)
+       to transfer ensemble knowledge to each individual model.
     """
 
     def __init__(
-        self, generator: nn.Module, temperature: float = 4.0, device: str = "cpu"
+        self,
+        generator: nn.Module,
+        temperature: float = 4.0,
+        device: str = "cpu",
+        gen_lr: float = 0.001,
+        distill_lr: float = 0.001,
+        batch_size: int = 32,
     ):
         self.generator = generator
         self.temperature = temperature
         self.device = device
+        self.batch_size = batch_size
+        self.gen_lr = gen_lr
+        self.distill_lr = distill_lr
         self.generator.to(device)
-        self.optimizer = torch.optim.Adam(self.generator.parameters(), lr=0.001)
+        self.gen_optimizer = torch.optim.Adam(
+            self.generator.parameters(), lr=self.gen_lr
+        )
 
-    def train_generator(self, ensemble_logits: torch.Tensor):
+    def distill(
+        self,
+        models: dict[str, nn.Module],
+        gen_steps: int = 10,
+        distill_steps: int = 5,
+    ) -> dict[str, nn.Module]:
         """
-        Generator training step (Placeholder for specific logic if needed distinct from update)
-        """
-        pass
-
-    def update(self, global_models: dict[str, nn.Module], num_steps: int = 10):
-        """
-        Generatorを更新し、各ファミリーモデルへ蒸留する
+        Run full FedGen distillation pipeline.
 
         Args:
-            global_models: 各ファミリー（または各クライアントARch）の代表モデル（重み更新済み）
+            models: dict mapping model name/signature to nn.Module
+            gen_steps: number of generator training steps
+            distill_steps: number of distillation steps per model
+
+        Returns:
+            Updated models dict with distilled knowledge
+        """
+        if len(models) < 2:
+            logger.info("Skipping FedGen: need >= 2 models for cross-distillation")
+            return models
+
+        logger.info(
+            f"FedGen distillation: {len(models)} models, "
+            f"gen_steps={gen_steps}, distill_steps={distill_steps}"
+        )
+
+        # Move all models to device
+        for model in models.values():
+            model.to(self.device)
+
+        # Phase 1: Train generator
+        self._train_generator(models, gen_steps)
+        self.generator.update_ema()
+
+        # Phase 2: Distill ensemble knowledge to each model
+        self._distill_to_models(models, distill_steps)
+
+        return models
+
+    def _train_generator(self, models: dict[str, nn.Module], num_steps: int) -> None:
+        """
+        Phase 1: Train generator to produce images that the ensemble
+        classifies consistently as the target labels.
         """
         self.generator.train()
-        for _ in range(num_steps):
-            # 1. Logit Ensemble
-            z, labels = self.generator.generate_batch(
-                32, device=self.device
-            )  # 32 is hardcoded
-            logits_list = []
 
-            for name, model in global_models.items():
-                model.eval()
-                model.to(self.device)
-                with torch.no_grad():
-                    out = model(z)
-                    logits_list.append(out)
+        # Freeze all model parameters
+        for model in models.values():
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad = False
 
-            if not logits_list:
-                continue
+        total_loss = 0.0
+        for step in range(num_steps):
+            self.gen_optimizer.zero_grad()
 
-            # Average Logits
-            _ensemble_logits = torch.stack(logits_list).mean(
-                dim=0
-            )  # TODO: use for distillation
+            # Generate batch (normalization applied inside generate_batch)
+            images, labels = self.generator.generate_batch(
+                self.batch_size, device=self.device
+            )
 
-            # 2. Train Generator
-            # Generator loss:
-            # 「生成した画像が、Ensembleモデルによって正しく分類されるようにする」
-            # これは "Class Impression" を生成することになる。
-            self.optimizer.zero_grad()
+            # Compute ensemble logits (average across all models)
+            ensemble_logits = self._compute_ensemble_logits(models, images)
 
-            # Re-generate with graph for dependency
-            # (Note: above 'z' generation detached? Generator.forward connects z to out?
-            # self.generator.generate_batch uses internal generator forward, so 'z' (image) has grad_fn)
-            # But the 'model(z)' part detached? No.
-            # However, 'model' parameters are fixed (no grad). We want to update Generator.
-            # So models should be fixed but allow gradient flow from input to output?
-            # Standard PyTorch models allow grad w.r.t input.
-
-            # Need to re-forward through generator to get graph,
-            # passed through fixed models to get loss, then backprop to generator.
-
-            # But above loop used 'with torch.no_grad():' -> Blocks flow to generator.
-            # Should allow grad for input z (which comes from generator).
-
-            # Correct Loop:
-            z_gen, labels_gen = self.generator.generate_batch(32, device=self.device)
-
-            loss = 0.0
-            avg_logits = 0
-            for name, model in global_models.items():
-                model.eval()
-                # fix model params
-                for p in model.parameters():
-                    p.requires_grad = False
-
-                out = model(z_gen)
-                avg_logits += out
-
-            avg_logits /= len(global_models)
-
-            # Loss: CrossEntropy(avg_logits, labels)
-            # Generator learns to generate images that the current ensemble classifies as 'labels'
-            loss = F.cross_entropy(avg_logits, labels_gen)
-
+            # Generator loss: encourage ensemble to classify correctly
+            loss = F.cross_entropy(ensemble_logits, labels)
             loss.backward()
-            self.optimizer.step()
+            self.gen_optimizer.step()
+            total_loss += loss.item()
 
-        self.generator.update_ema()
+        # Re-enable gradient computation for model parameters
+        for model in models.values():
+            for p in model.parameters():
+                p.requires_grad = True
+
+        avg_loss = total_loss / max(num_steps, 1)
+        logger.info(f"Generator training done: avg_loss={avg_loss:.4f}")
+
+    def _distill_to_models(self, models: dict[str, nn.Module], num_steps: int) -> None:
+        """
+        Phase 2: Distill ensemble knowledge to each individual model
+        using KL divergence with temperature scaling.
+        """
+        T = self.temperature
+
+        for name, student in models.items():
+            # Create a separate optimizer for each student
+            student_optimizer = torch.optim.SGD(
+                student.parameters(), lr=self.distill_lr, momentum=0.9
+            )
+            student.train()
+
+            total_loss = 0.0
+            for step in range(num_steps):
+                # Generate synthetic data
+                with torch.no_grad():
+                    images, labels = self.generator.generate_batch(
+                        self.batch_size, device=self.device, use_ema=True
+                    )
+
+                # Compute ensemble teacher logits (exclude current student)
+                with torch.no_grad():
+                    teacher_logits = self._compute_ensemble_logits(
+                        {k: v for k, v in models.items() if k != name},
+                        images,
+                    )
+
+                # Student forward pass
+                student_logits = student(images)
+
+                # KD loss: KL divergence with temperature
+                loss = self._kd_loss(student_logits, teacher_logits, T)
+
+                student_optimizer.zero_grad()
+                loss.backward()
+                student_optimizer.step()
+                total_loss += loss.item()
+
+            avg_loss = total_loss / max(num_steps, 1)
+            logger.info(f"Distilled model '{name}': avg_kd_loss={avg_loss:.4f}")
+
+    def _compute_ensemble_logits(
+        self, models: dict[str, nn.Module], images: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute average logits across all models in the ensemble."""
+        logits_sum = None
+        for model in models.values():
+            out = model(images)
+            if logits_sum is None:
+                logits_sum = out
+            else:
+                logits_sum = logits_sum + out
+        return logits_sum / len(models)
+
+    @staticmethod
+    def _kd_loss(
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        """
+        Knowledge distillation loss using KL divergence with temperature.
+
+        KD_loss = T^2 * KL(softmax(student/T) || softmax(teacher/T))
+        """
+        student_soft = F.log_softmax(student_logits / temperature, dim=1)
+        teacher_soft = F.softmax(teacher_logits / temperature, dim=1)
+        return F.kl_div(student_soft, teacher_soft, reduction="batchmean") * (
+            temperature**2
+        )

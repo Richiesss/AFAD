@@ -12,7 +12,7 @@ logger = setup_logger("AFADClient")
 
 class AFADClient(fl.client.NumPyClient):
     """
-    AFAD Client Implementation with HeteroFL support
+    AFAD Client Implementation with HeteroFL support.
 
     Supports receiving sub-models based on model_rate and
     properly applying parameters for heterogeneous model widths.
@@ -27,23 +27,33 @@ class AFADClient(fl.client.NumPyClient):
         device: str = "cpu",
         family: str = "default",
         model_rate: float = 1.0,
+        model_name: str = "",
+        val_loader=None,
+        lr: float = 0.01,
+        momentum: float = 0.9,
+        weight_decay: float = 0.0001,
     ):
         self.cid = cid
         self.model = model
         self.train_loader = train_loader
+        self.val_loader = val_loader
         self.epochs = epochs
         self.device = torch.device(device)
         self.model.to(self.device)
         self.family = family
-        self.model_rate = model_rate  # Client's model rate for HeteroFL
+        self.model_rate = model_rate
+        self.model_name = model_name
+        self.lr = lr
+        self.momentum = momentum
+        self.weight_decay = weight_decay
 
         logger.info(
-            f"Client {cid} initialized on device: {self.device}, "
-            f"family: {family}, model_rate: {model_rate}"
+            f"Client {cid} initialized: model={model_name}, device={self.device}, "
+            f"family={family}, model_rate={model_rate}"
         )
 
     def get_parameters(self, config) -> list[np.ndarray]:
-        """Return model parameters as a list of NumPy arrays"""
+        """Return model parameters as a list of NumPy arrays."""
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
 
     def set_parameters(self, parameters: list[np.ndarray], config: dict = None):
@@ -62,25 +72,18 @@ class AFADClient(fl.client.NumPyClient):
             )
 
         state_dict = OrderedDict()
-        for i, (key, param) in enumerate(zip(model_keys, parameters)):
+        for key, param in zip(model_keys, parameters):
             local_shape = self.model.state_dict()[key].shape
             received_shape = param.shape
 
             if local_shape == received_shape:
-                # Shapes match - direct assignment
                 state_dict[key] = torch.tensor(param)
             else:
-                # HeteroFL: received sub-model parameters
-                # Sub-model params are smaller and should be placed at the beginning
                 logger.debug(
                     f"Client {self.cid}: Layer {key} shape mismatch. "
                     f"Local: {local_shape}, Received: {received_shape}"
                 )
-
-                # Start with zeros (or could use current weights)
                 new_param = torch.zeros(local_shape)
-
-                # Copy received params to the beginning (top-left for multi-dim)
                 if len(local_shape) == 1:
                     new_param[: received_shape[0]] = torch.tensor(param)
                 elif len(local_shape) == 2:
@@ -92,7 +95,6 @@ class AFADClient(fl.client.NumPyClient):
                         torch.tensor(param)
                     )
                 else:
-                    # Fallback: try to fit what we can
                     slices = tuple(
                         slice(0, min(loc, rec))
                         for loc, rec in zip(local_shape, received_shape)
@@ -106,36 +108,30 @@ class AFADClient(fl.client.NumPyClient):
     def fit(
         self, parameters: list[np.ndarray], config: dict
     ) -> tuple[list[np.ndarray], int, dict]:
-        """
-        Train the model on local data.
-
-        Args:
-            parameters: Model parameters from server (may be sub-model or empty)
-            config: Configuration dict containing round, model_rate, family, etc.
-
-        Returns:
-            Tuple of (updated_parameters, num_examples, metrics)
-        """
-        # Update model_rate and family from config if provided
+        """Train the model on local data."""
         if "model_rate" in config:
             self.model_rate = config["model_rate"]
         if "family" in config:
             self.family = config["family"]
 
+        # Propagate training config from server
+        if "lr" in config:
+            self.lr = config["lr"]
+        if "momentum" in config:
+            self.momentum = config["momentum"]
+        if "weight_decay" in config:
+            self.weight_decay = config["weight_decay"]
+
         # Set parameters if provided and not using local initialization
         use_local_init = config.get("use_local_init", False)
         if parameters and len(parameters) > 0 and not use_local_init:
             self.set_parameters(parameters, config)
-        # else: use locally initialized model (first round or heterogeneous setup)
 
-        # Update local epochs from config
         if "local_epochs" in config:
             self.epochs = config["local_epochs"]
 
-        # Train
         self._train()
 
-        # Return updated weights
         return (
             self.get_parameters(config={}),
             len(self.train_loader.dataset),
@@ -143,67 +139,54 @@ class AFADClient(fl.client.NumPyClient):
                 "family": self.family,
                 "model_rate": self.model_rate,
                 "client_id": self.cid,
+                "model_name": self.model_name,
             },
         )
 
-    def _train(self):
-        """
-        Local training loop
-        """
-        from tqdm import tqdm
-
+    def _train(self) -> None:
+        """Local training loop."""
         criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        optimizer = torch.optim.SGD(
+            self.model.parameters(),
+            lr=self.lr,
+            momentum=self.momentum,
+            weight_decay=self.weight_decay,
+        )
         self.model.train()
 
         for epoch in range(self.epochs):
-            with tqdm(
-                self.train_loader,
-                unit="batch",
-                desc=f"Client {self.cid} Epoch {epoch + 1}/{self.epochs}",
-                leave=False,
-            ) as tepoch:
-                for images, labels in tepoch:
-                    images, labels = images.to(self.device), labels.to(self.device)
-
-                    optimizer.zero_grad()
-                    outputs = self.model(images)
-                    loss = criterion(outputs, labels)
-                    loss.backward()
-                    optimizer.step()
-
-                    tepoch.set_postfix(loss=loss.item())
+            for images, labels in self.train_loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                optimizer.zero_grad()
+                outputs = self.model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
 
     def evaluate(
         self, parameters: list[np.ndarray], config: dict
     ) -> tuple[float, int, dict]:
-        """
-        Evaluate the model on local data.
-
-        Args:
-            parameters: Model parameters from server
-            config: Configuration dict
-
-        Returns:
-            Tuple of (loss, num_examples, metrics)
-        """
+        """Evaluate the model on validation data (or train data as fallback)."""
         if parameters:
             self.set_parameters(parameters, config)
 
         self.model.eval()
         criterion = nn.CrossEntropyLoss()
 
+        eval_loader = (
+            self.val_loader if self.val_loader is not None else self.train_loader
+        )
+
         total_loss = 0.0
         correct = 0
         total = 0
 
         with torch.no_grad():
-            for images, labels in self.train_loader:
+            for images, labels in eval_loader:
                 images, labels = images.to(self.device), labels.to(self.device)
                 outputs = self.model(images)
                 loss = criterion(outputs, labels)
                 total_loss += loss.item() * labels.size(0)
-
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
@@ -218,5 +201,6 @@ class AFADClient(fl.client.NumPyClient):
                 "accuracy": accuracy,
                 "family": self.family,
                 "model_rate": self.model_rate,
+                "model_name": self.model_name,
             },
         )

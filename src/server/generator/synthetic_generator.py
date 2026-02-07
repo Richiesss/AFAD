@@ -3,34 +3,17 @@ import copy
 import torch
 import torch.nn as nn
 
+# MNIST normalization constants
+MNIST_MEAN = 0.1307
+MNIST_STD = 0.3081
+
 
 class SyntheticGenerator(nn.Module):
     """
-    FedGen/DFRD方式の合成データ生成器
+    Data-Free KD synthetic image generator for FedGen distillation.
 
-    Args:
-        latent_dim (int): 潜在空間の次元数
-        num_classes (int): クラス数
-        feature_dim (int): 出力特徴量の次元数 (Logit蒸留を行う場合はLogit次元=num_classes、特徴量蒸留ならD)
-                           AFAD仕様書では「特徴表現 f in R^d (画像ではなく潜在表現)」とあるが、
-                           異種間知識蒸留 F-004 では「ロジットベース」と記述あり。
-                           異種間モデルの共通項は「ロジット」なので、Generatorは「ロジット」または
-                           「共通の特徴量空間」を出力する必要がある。
-                           FedGenの元論文ではFeatureを出力してClassifierに通すが、
-                           AFADでは「異種間」なのでClassifierも異なる。
-                           よって、Generatorは「入力としての仮想データ（特徴量）」を出力し、
-                           各クライアントの「Feature Extractorより上位の層」に入力するか、
-                           あるいは「蒸留用データ」として各モデルに入力可能な形式（画像サイズのテンソル）を出力するか。
-
-                           仕様書の図 F-003: "出力: 特徴表現 f"
-                           仕様書の F-004: "z_s: Studentの出力ロジット", "z_t: Teacherの出力ロジット"
-
-                           この矛盾（画像入力モデルに特徴量をどう入れるか）を解決するため、
-                           ここではGeneratorは「画像サイズ (1, 28, 28)」を生成するGeneratorとして実装する。
-                           これにより全てのCNN/ViTモデルに等しく入力可能となる。
-                           (Data-Free KDの標準的なアプローチ)
-        hidden_dims (List[int]): 中間層の次元
-        ema_decay (float): EMAの減衰率
+    Generates MNIST-like images (1, 28, 28) that can be fed to any CNN/ViT model.
+    Output is normalized to match MNIST distribution (mean=0.1307, std=0.3081).
     """
 
     def __init__(
@@ -53,7 +36,7 @@ class SyntheticGenerator(nn.Module):
         self.label_embed = nn.Embedding(num_classes, latent_dim)
 
         # Generator Network
-        layers = []
+        layers: list[nn.Module] = []
         input_dim = latent_dim * 2  # Noise + Label
 
         for h_dim in hidden_dims:
@@ -72,12 +55,7 @@ class SyntheticGenerator(nn.Module):
             output_dim *= d
 
         layers.append(nn.Linear(input_dim, output_dim))
-        layers.append(
-            nn.Sigmoid()
-        )  # For image [0,1] normalization (MNIST is approx in this range when normalized, roughly)
-        # Note: MNIST data loader normalizes to mean 0.1307, std 0.3081.
-        # Output should ideally match this distribution or we use Tanh and denormalize?
-        # For simplicity, Sigmoid -> [0, 1] is decent for "image-like" generation.
+        layers.append(nn.Sigmoid())  # Output in [0, 1]
 
         self.generator = nn.Sequential(*layers)
 
@@ -86,9 +64,14 @@ class SyntheticGenerator(nn.Module):
 
     def forward(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
-        Generate synthetic data
-        z: [Batch, Latent]
-        labels: [Batch]
+        Generate synthetic data (raw [0,1] range, no MNIST normalization).
+
+        Args:
+            z: [Batch, Latent] noise tensor
+            labels: [Batch] class labels
+
+        Returns:
+            Generated images [Batch, C, H, W] in [0, 1] range
         """
         c = self.label_embed(labels)
         x = torch.cat([z, c], dim=1)
@@ -96,7 +79,7 @@ class SyntheticGenerator(nn.Module):
         return out.view(-1, *self.output_shape)
 
     @torch.no_grad()
-    def update_ema(self):
+    def update_ema(self) -> None:
         for p, ema_p in zip(
             self.generator.parameters(), self.ema_generator.parameters()
         ):
@@ -105,19 +88,15 @@ class SyntheticGenerator(nn.Module):
     def generate_batch(
         self, batch_size: int, device: str = "cpu", use_ema: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate a batch of synthetic images with MNIST normalization applied.
+
+        Returns:
+            Tuple of (images, labels) where images are normalized to match
+            MNIST distribution (mean=0.1307, std=0.3081).
+        """
         z = torch.randn(batch_size, self.latent_dim).to(device)
         labels = torch.randint(0, self.num_classes, (batch_size,)).to(device)
-
-        # Forward manually to handle separate embedding if needed, but current forward does it.
-        # But EMA generator is just the sequential part? No, self.ema_generator is copy of self.generator (Sequential)
-        # Ah, self.generator is the Sequential part in __init__, but the class has label_embed too.
-        # I should make sure EMA copy includes label_embed.
-        # Let's fix __init__ to separate model properly or copy whole module.
-        pass  # Fixed below via re-implementation logic in prompt
-
-        # Re-implementation for correctness:
-        # Instead of deepcopying just self.generator, I need to handle the whole forward logic.
-        # Let's assume generate_batch calls forward.
 
         c = self.label_embed(labels)
         x = torch.cat([z, c], dim=1)
@@ -127,4 +106,9 @@ class SyntheticGenerator(nn.Module):
         else:
             out = self.generator(x)
 
-        return out.view(-1, *self.output_shape), labels
+        images = out.view(-1, *self.output_shape)
+
+        # Apply MNIST normalization so generated images match trained model expectations
+        images = (images - MNIST_MEAN) / MNIST_STD
+
+        return images, labels
