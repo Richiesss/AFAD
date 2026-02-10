@@ -1,6 +1,5 @@
 """Integration test: verifies the full AFAD pipeline end-to-end."""
 
-import numpy as np
 from flwr.common import (
     Code,
     FitRes,
@@ -41,9 +40,9 @@ class _MockClientProxy(ClientProxy):
         return None
 
 
-def _build_strategy() -> AFADStrategy:
+def _build_strategy(enable_fedgen: bool = True) -> AFADStrategy:
     """Create an AFADStrategy with model factories for ResNet18 and ViT-Tiny."""
-    generator = SyntheticGenerator(latent_dim=32, num_classes=10)
+    generator = SyntheticGenerator(noise_dim=32, num_classes=10, hidden_dim=64)
     router = FamilyRouter()
     model_factories = {
         "resnet18": lambda num_classes=10: ModelRegistry.create_model(
@@ -62,11 +61,18 @@ def _build_strategy() -> AFADStrategy:
         initial_generator=generator,
         family_router=router,
         model_factories=model_factories,
+        enable_fedgen=enable_fedgen,
         fedgen_config={
-            "temperature": 4.0,
-            "gen_steps": 2,
-            "distill_steps": 2,
+            "gen_lr": 1e-3,
             "batch_size": 8,
+            "gen_epochs": 1,
+            "teacher_iters": 2,
+            "temperature": 4.0,
+            "distill_lr": 1e-3,
+            "distill_epochs": 1,
+            "distill_steps": 2,
+            "distill_alpha": 0.7,
+            "device": "cpu",
         },
         training_config={"lr": 0.01, "momentum": 0.9, "local_epochs": 1},
         min_fit_clients=2,
@@ -74,13 +80,6 @@ def _build_strategy() -> AFADStrategy:
         fraction_fit=1.0,
         fraction_evaluate=0.0,
     )
-
-
-def _simulate_client_fit(
-    client: AFADClient, config: dict
-) -> tuple[list[np.ndarray], int, dict]:
-    """Run a client fit with empty parameters (first round)."""
-    return client.fit(parameters=[], config=config)
 
 
 class TestIntegration:
@@ -93,7 +92,7 @@ class TestIntegration:
         )
 
     def test_two_round_pipeline(self):
-        """Run 2 rounds: verify HeteroFL aggregation + FedGen distillation."""
+        """Run 2 rounds: verify HeteroFL aggregation + FedGen generator training."""
         client_cnn = AFADClient(
             cid="0",
             model=ModelRegistry.create_model("resnet18"),
@@ -140,7 +139,10 @@ class TestIntegration:
         # After 2 rounds, strategy should have 2 model groups
         assert len(self.strategy.global_models) == 2
 
-        # FedGen should have been triggered in round 2
+        # Generator should have been trained
+        assert self.strategy._generator_trained
+
+        # Model names should be tracked
         assert len(self.strategy.sig_to_model_name) == 2
 
     def test_global_models_have_correct_signatures(self):
@@ -187,3 +189,67 @@ class TestIntegration:
         # Model names should be tracked
         model_names = set(self.strategy.sig_to_model_name.values())
         assert model_names == {"resnet18", "vit_tiny"}
+
+    def test_label_counts_collected(self):
+        """Verify label counts are collected from client fit metrics."""
+        client = AFADClient(
+            cid="0",
+            model=ModelRegistry.create_model("resnet18"),
+            train_loader=self.train_loaders[0],
+            epochs=1,
+            device="cpu",
+            model_name="resnet18",
+        )
+
+        params, num_ex, metrics = client.fit([], {"use_local_init": True})
+
+        # label_counts should be in metrics as comma-separated string
+        assert "label_counts" in metrics
+        counts_str = metrics["label_counts"]
+        counts = [int(x) for x in counts_str.split(",")]
+        assert len(counts) == 10
+        assert sum(counts) > 0
+
+    def test_fedgen_disabled_no_generator_training(self):
+        """With enable_fedgen=False, generator should not be trained."""
+        strategy = _build_strategy(enable_fedgen=False)
+
+        client_cnn = AFADClient(
+            cid="0",
+            model=ModelRegistry.create_model("resnet18"),
+            train_loader=self.train_loaders[0],
+            epochs=1,
+            device="cpu",
+            family="cnn",
+            model_name="resnet18",
+        )
+        client_vit = AFADClient(
+            cid="1",
+            model=ModelRegistry.create_model("vit_tiny"),
+            train_loader=self.train_loaders[1],
+            epochs=1,
+            device="cpu",
+            family="vit",
+            model_name="vit_tiny",
+        )
+
+        results = []
+        for cid, client in [("0", client_cnn), ("1", client_vit)]:
+            params, num_ex, metrics = client.fit(
+                [], {"use_local_init": True, "round": 1}
+            )
+            proxy = _MockClientProxy(cid)
+            results.append(
+                (
+                    proxy,
+                    FitRes(
+                        status=Status(code=Code.OK, message="ok"),
+                        parameters=ndarrays_to_parameters(params),
+                        num_examples=num_ex,
+                        metrics=metrics,
+                    ),
+                )
+            )
+
+        strategy.aggregate_fit(1, results, failures=[])
+        assert not strategy._generator_trained

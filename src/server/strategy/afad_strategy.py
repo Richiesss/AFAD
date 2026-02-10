@@ -26,6 +26,11 @@ from src.utils.metrics import MetricsCollector
 
 logger = setup_logger("AFADStrategy")
 
+# FedGen regularization starts after this many warmup rounds.
+# Models need ~6 rounds of independent training to reach 60-70% accuracy
+# before generator-based regularization becomes beneficial.
+FEDGEN_WARMUP_ROUNDS = 3
+
 
 class AFADStrategy(fl.server.strategy.FedAvg):
     """
@@ -33,6 +38,12 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
     Combines HeteroFL (intra-family, same architecture) and FedGen (inter-family)
     aggregation for heterogeneous federated learning.
+
+    FedGen flow per round (server-side distillation):
+    1. configure_fit: Send model params to clients
+    2. Client fit: Standard local training (no FedGen regularization)
+    3. aggregate_fit: HeteroFL aggregate → train generator → distill models
+    4. configure_evaluate / aggregate_evaluate: Standard evaluation
     """
 
     def __init__(
@@ -44,12 +55,14 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         client_model_rates: dict[str, float] | None = None,
         fedgen_config: dict[str, Any] | None = None,
         training_config: dict[str, Any] | None = None,
+        enable_fedgen: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.generator = initial_generator
         self.router = family_router
         self.model_factories = model_factories or {}
+        self.enable_fedgen = enable_fedgen
 
         # Per-signature global models (stored as numpy arrays)
         self.global_models: dict[str, list[np.ndarray]] = {}
@@ -64,26 +77,37 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         # Signature to model_name mapping (populated from client fit metrics)
         self.sig_to_model_name: dict[str, str] = {}
 
+        # Per-client label counts for FedGen label weighting
+        self.client_label_counts: dict[str, list[int]] = {}
+
         self.hetero_aggregator = HeteroFLAggregator()
 
         # FedGen configuration
         fedgen_cfg = fedgen_config or {}
         self.fedgen_distiller = FedGenDistiller(
             generator=self.generator,
-            temperature=fedgen_cfg.get("temperature", 4.0),
-            gen_lr=fedgen_cfg.get("gen_lr", 0.001),
-            distill_lr=fedgen_cfg.get("distill_lr", 0.001),
-            batch_size=fedgen_cfg.get("batch_size", 32),
+            gen_lr=fedgen_cfg.get("gen_lr", 3e-4),
+            batch_size=fedgen_cfg.get("batch_size", 128),
+            ensemble_alpha=fedgen_cfg.get("ensemble_alpha", 1.0),
+            ensemble_eta=fedgen_cfg.get("ensemble_eta", 1.0),
             device=fedgen_cfg.get("device", "cpu"),
+            temperature=fedgen_cfg.get("temperature", 4.0),
+            distill_lr=fedgen_cfg.get("distill_lr", 1e-3),
+            distill_epochs=fedgen_cfg.get("distill_epochs", 1),
+            distill_steps=fedgen_cfg.get("distill_steps", 10),
+            distill_alpha=fedgen_cfg.get("distill_alpha", 0.7),
         )
-        self.fedgen_gen_steps = fedgen_cfg.get("gen_steps", 10)
-        self.fedgen_distill_steps = fedgen_cfg.get("distill_steps", 5)
+        self.fedgen_gen_epochs = fedgen_cfg.get("gen_epochs", 1)
+        self.fedgen_teacher_iters = fedgen_cfg.get("teacher_iters", 20)
 
         # Training config to propagate to clients
         self.training_config = training_config or {}
 
         # Metrics
         self.metrics_collector = MetricsCollector()
+
+        # Track whether generator has been trained at least once
+        self._generator_trained = False
 
     def set_client_model_rate(self, client_id: str, model_rate: float) -> None:
         self.client_model_rates[client_id] = model_rate
@@ -107,7 +131,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         parameters: Parameters,
         client_manager: fl.server.client_manager.ClientManager,
     ) -> list[tuple[ClientProxy, FitIns]]:
-        """Configure the next round of training."""
+        """Configure the next round of training, sending model params to clients."""
         logger.info(f"Round {server_round}: configure_fit")
         self.metrics_collector.start_round()
 
@@ -124,7 +148,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             new_config = dict(fit_ins.config)
             new_config["round"] = server_round
 
-            # Only send family if actually known (avoid overriding client's own family)
+            # Only send family if actually known
             family = self.client_family_map.get(cid)
             if family:
                 new_config["family"] = family
@@ -137,11 +161,12 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             # Send matching global model if available
             sig = self.client_model_signatures.get(cid)
             if sig and sig in self.global_models:
-                client_parameters = ndarrays_to_parameters(self.global_models[sig])
+                model_ndarrays = self.global_models[sig]
             else:
-                client_parameters = ndarrays_to_parameters([])
+                model_ndarrays = []
                 new_config["use_local_init"] = True
 
+            client_parameters = ndarrays_to_parameters(model_ndarrays)
             new_fit_ins.append((client, FitIns(client_parameters, new_config)))
 
         return new_fit_ins
@@ -153,11 +178,12 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         failures: list[tuple[ClientProxy, FitRes] | BaseException],
     ) -> tuple[Parameters | None, dict[str, Scalar]]:
         """
-        Aggregate client updates with HeteroFL + FedGen distillation.
+        Aggregate client updates with HeteroFL + FedGen generator training.
 
         1. Group clients by model signature
         2. Apply HeteroFL aggregation within each group
-        3. Run FedGen inter-family distillation (after round 1)
+        3. Collect label counts from clients
+        4. Train generator using aggregated models (FedGen server-side)
         """
         logger.info(f"Round {server_round}: aggregate_fit")
         if not results:
@@ -176,6 +202,13 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             # Track client family for future rounds
             if family and family != "default":
                 self.client_family_map[cid] = family
+
+            # Parse and store label counts
+            label_counts_str = fit_res.metrics.get("label_counts", "")
+            if isinstance(label_counts_str, str) and label_counts_str:
+                counts = [int(x) for x in label_counts_str.split(",") if x]
+                self.client_label_counts[cid] = counts
+
             params = parameters_to_ndarrays(fit_res.parameters)
 
             sig = self._get_model_signature(params)
@@ -213,10 +246,9 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 f"from families {families}"
             )
 
-        # FedGen distillation (after warmup rounds, when >= 2 unique models exist)
-        FEDGEN_WARMUP_ROUNDS = 3
-        if server_round > FEDGEN_WARMUP_ROUNDS and len(self.global_models) >= 2:
-            self._run_fedgen_distillation()
+        # FedGen: Train generator + distill models after aggregation
+        if self.enable_fedgen and len(self.global_models) >= 2:
+            self._train_generator_on_server(server_round)
 
         # Metrics
         metrics: dict[str, Scalar] = {
@@ -228,33 +260,34 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         # Return first model as "main" global for Flower
         if self.global_models:
             main_sig = list(self.global_models.keys())[0]
-            return ndarrays_to_parameters(self.global_models[main_sig]), metrics
+            return (
+                ndarrays_to_parameters(self.global_models[main_sig]),
+                metrics,
+            )
 
         return None, metrics
 
-    def _run_fedgen_distillation(self) -> None:
-        """Reconstruct nn.Module models from numpy arrays, run FedGen, write back."""
+    def _train_generator_on_server(self, server_round: int) -> None:
+        """Reconstruct nn.Module models, train generator, and distill models."""
         if not self.model_factories:
-            logger.warning("No model_factories provided; skipping FedGen distillation")
+            logger.warning("No model_factories provided; skipping generator training")
             return
 
         # Reconstruct nn.Module from stored numpy arrays
         torch_models: dict[str, nn.Module] = {}
-        sig_order: list[str] = []
 
         for sig, np_params in self.global_models.items():
             model_name = self.sig_to_model_name.get(sig)
             if model_name and model_name in self.model_factories:
                 model = self.model_factories[model_name](num_classes=10)
-                # Load numpy params into model
                 state_dict = model.state_dict()
                 keys = list(state_dict.keys())
                 if len(keys) == len(np_params):
                     for key, arr in zip(keys, np_params):
                         state_dict[key] = torch.from_numpy(arr.copy())
                     model.load_state_dict(state_dict)
+                    model.to(self.fedgen_distiller.device)
                     torch_models[sig] = model
-                    sig_order.append(sig)
                 else:
                     logger.warning(
                         f"Param count mismatch for sig={sig[:30]}...: "
@@ -266,24 +299,52 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 )
 
         if len(torch_models) < 2:
-            logger.info("Not enough reconstructable models for FedGen distillation")
+            logger.info("Not enough reconstructable models for generator training")
             return
 
-        # Run FedGen distillation
-        updated_models = self.fedgen_distiller.distill(
-            torch_models,
-            gen_steps=self.fedgen_gen_steps,
-            distill_steps=self.fedgen_distill_steps,
+        # Compute label weights from client label counts
+        label_counts_list = list(self.client_label_counts.values())
+        if not label_counts_list:
+            # Fallback: uniform weights
+            num_models = len(torch_models)
+            label_weights = np.ones((10, num_models)) / num_models
+            qualified_labels = list(range(10))
+        else:
+            label_weights, qualified_labels = self.fedgen_distiller.get_label_weights(
+                label_counts_list
+            )
+
+        # Train generator
+        self.fedgen_distiller.train_generator(
+            models=torch_models,
+            label_weights=label_weights,
+            qualified_labels=qualified_labels,
+            num_epochs=self.fedgen_gen_epochs,
+            num_teacher_iters=self.fedgen_teacher_iters,
         )
 
-        # Write back updated parameters
-        for sig, model in updated_models.items():
-            updated_np = [
-                val.cpu().detach().numpy() for val in model.state_dict().values()
-            ]
-            self.global_models[sig] = updated_np
+        self._generator_trained = True
+        logger.info(f"Generator trained with {len(torch_models)} models")
 
-        logger.info(f"FedGen distillation updated {len(updated_models)} models")
+        # Server-side knowledge distillation (after warmup)
+        if server_round > FEDGEN_WARMUP_ROUNDS:
+            distill_losses = self.fedgen_distiller.distill_models(
+                models=torch_models,
+                label_weights=label_weights,
+                qualified_labels=qualified_labels,
+            )
+
+            # Write distilled model params back to global_models
+            if distill_losses:
+                for sig, model in torch_models.items():
+                    self.global_models[sig] = [
+                        val.cpu().detach().numpy()
+                        for val in model.state_dict().values()
+                    ]
+                logger.info(
+                    f"Distilled {len(distill_losses)} models, "
+                    f"avg_loss={sum(distill_losses.values()) / len(distill_losses):.4f}"
+                )
 
     def configure_evaluate(
         self,

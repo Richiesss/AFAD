@@ -2,29 +2,32 @@ experiment:
   name: "AFAD_MNIST_Phase1"
   seed: 42
   num_rounds: 20
-  
+
 server:
   address: "0.0.0.0:8080"
   min_clients: 5
   min_fit_clients: 5
-  
+
 strategy:
   type: "AFAD"
   intra_family: "heterofl"      # 同族内集約方式
   inter_family: "fedgen"        # 異種間集約方式
-  temperature: 4.0              # KD温度
-  distill_steps: 10             # 蒸留ステップ数/ラウンド
   generator:
-    latent_dim: 100
-    hidden_dims: [256, 512]
-    ema_decay: 0.9
+    noise_dim: 32
+    hidden_dim: 256
   fedgen:
-    temperature: 4.0
-    gen_steps: 10
-    distill_steps: 3
-    gen_lr: 0.001
-    distill_lr: 0.0001
-    batch_size: 32
+    gen_lr: 0.0003              # Generator 学習率 (Adam)
+    batch_size: 128             # Generator 学習バッチサイズ
+    ensemble_alpha: 1.0         # Server: Teacher Loss 重み
+    ensemble_eta: 1.0           # Server: Diversity Loss 重み
+    gen_epochs: 2               # Generator 学習エポック数/ラウンド
+    teacher_iters: 25           # Teacher イテレーション数/エポック
+    # Server-side knowledge distillation (replaces client-side regularization)
+    temperature: 4.0            # KD temperature (higher = softer labels)
+    distill_lr: 0.0001          # Distillation learning rate (Adam, conservative)
+    distill_epochs: 1           # Distillation epochs per round
+    distill_steps: 5            # Gradient steps per epoch (conservative)
+    distill_alpha: 1.0          # KD loss weight (1.0 = KD only, no hard label CE)
 
 clients:
   - id: "client_0"
@@ -53,7 +56,7 @@ data:
   num_classes: 10
   distribution: "iid"           # iid | non_iid
   batch_size: 64
-  
+
 training:
   local_epochs: 2
   learning_rate: 0.01

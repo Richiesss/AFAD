@@ -122,9 +122,13 @@ def main():
 
     # Strategy components
     family_router = FamilyRouter()
+    strategy_cfg = config_dict.get("strategy", {})
+    fedgen_yaml = strategy_cfg.get("fedgen", {})
+
     generator = SyntheticGenerator(
-        latent_dim=config_dict["strategy"]["generator"]["latent_dim"],
+        noise_dim=32,
         num_classes=10,
+        hidden_dim=256,
     )
 
     # Initial parameters (dummy for Flower)
@@ -136,13 +140,21 @@ def main():
     # Model factories for FedGen reconstruction
     model_factories = build_model_factories()
 
-    # FedGen config from YAML
-    strategy_cfg = config_dict.get("strategy", {})
-    fedgen_config = strategy_cfg.get("fedgen", {})
-    fedgen_config.setdefault("temperature", strategy_cfg.get("temperature", 4.0))
-    fedgen_config.setdefault("gen_steps", strategy_cfg.get("distill_steps", 10))
-    fedgen_config.setdefault("distill_steps", 5)
-    fedgen_config.setdefault("device", device_type)
+    # FedGen config
+    fedgen_config = {
+        "gen_lr": fedgen_yaml.get("gen_lr", 3e-4),
+        "batch_size": fedgen_yaml.get("batch_size", 128),
+        "ensemble_alpha": fedgen_yaml.get("ensemble_alpha", 1.0),
+        "ensemble_eta": fedgen_yaml.get("ensemble_eta", 1.0),
+        "gen_epochs": fedgen_yaml.get("gen_epochs", 2),
+        "teacher_iters": fedgen_yaml.get("teacher_iters", 25),
+        "temperature": fedgen_yaml.get("temperature", 4.0),
+        "distill_lr": fedgen_yaml.get("distill_lr", 1e-4),
+        "distill_epochs": fedgen_yaml.get("distill_epochs", 1),
+        "distill_steps": fedgen_yaml.get("distill_steps", 5),
+        "distill_alpha": fedgen_yaml.get("distill_alpha", 1.0),
+        "device": "cpu",  # Server-side generator/distillation on CPU (GPU reserved for Ray actors)
+    }
 
     # Training config to propagate to clients
     training_cfg = config_dict.get("training", {})

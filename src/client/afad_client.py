@@ -12,10 +12,11 @@ logger = setup_logger("AFADClient")
 
 class AFADClient(fl.client.NumPyClient):
     """
-    AFAD Client Implementation with HeteroFL support.
+    AFAD Client with HeteroFL support.
 
-    Supports receiving sub-models based on model_rate and
-    properly applying parameters for heterogeneous model widths.
+    Standard local training with SGD. Knowledge distillation is handled
+    server-side (not client-side) to avoid contaminating training with
+    low-quality generated images.
     """
 
     def __init__(
@@ -47,10 +48,21 @@ class AFADClient(fl.client.NumPyClient):
         self.momentum = momentum
         self.weight_decay = weight_decay
 
+        # Precompute label counts from training data
+        self.label_counts = self._compute_label_counts()
+
         logger.info(
             f"Client {cid} initialized: model={model_name}, device={self.device}, "
             f"family={family}, model_rate={model_rate}"
         )
+
+    def _compute_label_counts(self) -> list[int]:
+        """Count per-class samples in training data (computed once)."""
+        counts = [0] * 10  # MNIST: 10 classes
+        for _, labels in self.train_loader:
+            for label in labels:
+                counts[label.item()] += 1
+        return counts
 
     def get_parameters(self, config) -> list[np.ndarray]:
         """Return model parameters as a list of NumPy arrays."""
@@ -60,8 +72,7 @@ class AFADClient(fl.client.NumPyClient):
         """
         Set model parameters from a list of NumPy arrays.
 
-        Handles HeteroFL sub-models where parameters may have different shapes
-        than the local model (when model_rate < 1.0).
+        Handles HeteroFL sub-models where parameters may have different shapes.
         """
         model_keys = list(self.model.state_dict().keys())
 
@@ -121,16 +132,18 @@ class AFADClient(fl.client.NumPyClient):
             self.momentum = config["momentum"]
         if "weight_decay" in config:
             self.weight_decay = config["weight_decay"]
+        if "local_epochs" in config:
+            self.epochs = config["local_epochs"]
 
-        # Set parameters if provided and not using local initialization
+        # Set model parameters if provided
         use_local_init = config.get("use_local_init", False)
         if parameters and len(parameters) > 0 and not use_local_init:
             self.set_parameters(parameters, config)
 
-        if "local_epochs" in config:
-            self.epochs = config["local_epochs"]
-
         self._train()
+
+        # Serialize label_counts as comma-separated string for Flower Scalar
+        label_counts_str = ",".join(str(c) for c in self.label_counts)
 
         return (
             self.get_parameters(config={}),
@@ -140,11 +153,12 @@ class AFADClient(fl.client.NumPyClient):
                 "model_rate": self.model_rate,
                 "client_id": self.cid,
                 "model_name": self.model_name,
+                "label_counts": label_counts_str,
             },
         )
 
     def _train(self) -> None:
-        """Local training loop."""
+        """Local training loop with SGD and gradient clipping."""
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.SGD(
             self.model.parameters(),
@@ -154,13 +168,14 @@ class AFADClient(fl.client.NumPyClient):
         )
         self.model.train()
 
-        for epoch in range(self.epochs):
+        for _epoch in range(self.epochs):
             for images, labels in self.train_loader:
                 images, labels = images.to(self.device), labels.to(self.device)
                 optimizer.zero_grad()
                 outputs = self.model(images)
                 loss = criterion(outputs, labels)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
                 optimizer.step()
 
     def evaluate(
