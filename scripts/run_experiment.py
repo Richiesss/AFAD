@@ -153,6 +153,8 @@ def main():
         "distill_epochs": fedgen_yaml.get("distill_epochs", 1),
         "distill_steps": fedgen_yaml.get("distill_steps", 5),
         "distill_alpha": fedgen_yaml.get("distill_alpha", 1.0),
+        "distill_beta": fedgen_yaml.get("distill_beta", 0.1),
+        "distill_every": fedgen_yaml.get("distill_every", 2),
         "device": "cpu",  # Server-side generator/distillation on CPU (GPU reserved for Ray actors)
     }
 

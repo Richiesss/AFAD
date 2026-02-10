@@ -135,6 +135,8 @@ def run_single_experiment(
         "distill_epochs": 1,
         "distill_steps": 5,
         "distill_alpha": 1.0,
+        "distill_beta": 0.1,
+        "distill_every": 2,
         "device": "cpu",  # Server-side generator/distillation on CPU (GPU reserved for Ray actors)
     }
 

@@ -42,6 +42,8 @@ class FedGenDistiller:
         distill_epochs: int = 1,
         distill_steps: int = 5,
         distill_alpha: float = 1.0,
+        distill_beta: float = 0.1,
+        distill_every: int = 2,
     ):
         self.generator = generator
         self.gen_lr = gen_lr
@@ -54,6 +56,8 @@ class FedGenDistiller:
         self.distill_epochs = distill_epochs
         self.distill_steps = distill_steps
         self.distill_alpha = distill_alpha
+        self.distill_beta = distill_beta  # EMA blending factor (0.1 = 10% distilled)
+        self.distill_every = distill_every  # Distill every N rounds after warmup
         self.generator.to(device)
         self.gen_optimizer = torch.optim.Adam(
             self.generator.parameters(), lr=self.gen_lr
@@ -276,10 +280,12 @@ class FedGenDistiller:
         temperature = temperature if temperature is not None else self.temperature
         alpha = distill_alpha if distill_alpha is not None else self.distill_alpha
         lr = distill_lr if distill_lr is not None else self.distill_lr
+        beta = self.distill_beta
 
         logger.info(
             f"Distillation: {len(models)} models, "
-            f"epochs={num_epochs}, steps={num_steps}, T={temperature}, α={alpha}"
+            f"epochs={num_epochs}, steps={num_steps}, T={temperature}, "
+            f"α={alpha}, β={beta}"
         )
 
         # Freeze generator
@@ -305,6 +311,11 @@ class FedGenDistiller:
 
         for student_sig in model_sigs:
             student = models[student_sig]
+
+            # Save original weights before distillation (for EMA blending)
+            original_state = {
+                name: param.data.clone() for name, param in student.named_parameters()
+            }
 
             # Use eval mode to preserve BN running stats from real data
             student.eval()
@@ -374,6 +385,12 @@ class FedGenDistiller:
 
                     total_loss += loss.item()
                     total_steps_done += 1
+
+            # EMA blending: new = (1-β)*original + β*distilled
+            # Keeps most of the real-data-trained weights, gently absorbs KD
+            with torch.no_grad():
+                for name, param in student.named_parameters():
+                    param.data = (1 - beta) * original_state[name] + beta * param.data
 
             avg_loss = total_loss / max(total_steps_done, 1)
             distill_losses[student_sig] = avg_loss

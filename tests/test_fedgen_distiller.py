@@ -249,3 +249,85 @@ class TestDistillModels:
                 assert p.requires_grad, "Model params should have grad enabled"
         for p in self.generator.parameters():
             assert p.requires_grad, "Generator params should have grad enabled"
+
+    def test_distill_ema_blending(self):
+        """EMA blending should limit weight change proportional to beta."""
+        # Use high beta=1.0 (full distillation) to confirm weights change a lot
+        distiller_full = FedGenDistiller(
+            generator=self.generator,
+            gen_lr=1e-3,
+            batch_size=8,
+            device="cpu",
+            distill_lr=1e-2,
+            distill_steps=5,
+            distill_beta=1.0,
+        )
+        # Use low beta=0.1 (gentle EMA) to confirm weights change little
+        distiller_gentle = FedGenDistiller(
+            generator=SyntheticGenerator(noise_dim=32, num_classes=10, hidden_dim=64),
+            gen_lr=1e-3,
+            batch_size=8,
+            device="cpu",
+            distill_lr=1e-2,
+            distill_steps=5,
+            distill_beta=0.1,
+        )
+
+        # Two identical model pairs
+        torch.manual_seed(42)
+        models_full = {"a": _make_simple_model(), "b": _make_simple_model()}
+        torch.manual_seed(42)
+        models_gentle = {"a": _make_simple_model(), "b": _make_simple_model()}
+        label_weights = np.ones((10, 2)) / 2
+
+        # Train both generators identically
+        torch.manual_seed(99)
+        distiller_full.train_generator(
+            models_full,
+            label_weights,
+            list(range(10)),
+            num_epochs=1,
+            num_teacher_iters=3,
+        )
+        torch.manual_seed(99)
+        distiller_gentle.train_generator(
+            models_gentle,
+            label_weights,
+            list(range(10)),
+            num_epochs=1,
+            num_teacher_iters=3,
+        )
+
+        # Save originals
+        orig_full = [p.clone() for p in models_full["a"].parameters()]
+        orig_gentle = [p.clone() for p in models_gentle["a"].parameters()]
+
+        # Distill both
+        torch.manual_seed(123)
+        distiller_full.distill_models(
+            models_full,
+            label_weights,
+            list(range(10)),
+            min_quality=0.0,
+        )
+        torch.manual_seed(123)
+        distiller_gentle.distill_models(
+            models_gentle,
+            label_weights,
+            list(range(10)),
+            min_quality=0.0,
+        )
+
+        # Compare weight changes: gentle (β=0.1) should change less than full (β=1.0)
+        delta_full = sum(
+            (p - o).abs().sum().item()
+            for p, o in zip(models_full["a"].parameters(), orig_full)
+        )
+        delta_gentle = sum(
+            (p - o).abs().sum().item()
+            for p, o in zip(models_gentle["a"].parameters(), orig_gentle)
+        )
+        assert delta_gentle < delta_full, (
+            f"EMA (β=0.1) change {delta_gentle:.4f} should be < "
+            f"full (β=1.0) change {delta_full:.4f}"
+        )

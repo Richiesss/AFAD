@@ -28,6 +28,8 @@ strategy:
     distill_epochs: 1           # Distillation epochs per round
     distill_steps: 5            # Gradient steps per epoch (conservative)
     distill_alpha: 1.0          # KD loss weight (1.0 = KD only, no hard label CE)
+    distill_beta: 0.1           # EMA blending: (1-β)*original + β*distilled
+    distill_every: 2            # Distill every N rounds after warmup
 
 clients:
   - id: "client_0"

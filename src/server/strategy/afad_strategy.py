@@ -92,10 +92,12 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             ensemble_eta=fedgen_cfg.get("ensemble_eta", 1.0),
             device=fedgen_cfg.get("device", "cpu"),
             temperature=fedgen_cfg.get("temperature", 4.0),
-            distill_lr=fedgen_cfg.get("distill_lr", 1e-3),
+            distill_lr=fedgen_cfg.get("distill_lr", 1e-4),
             distill_epochs=fedgen_cfg.get("distill_epochs", 1),
-            distill_steps=fedgen_cfg.get("distill_steps", 10),
-            distill_alpha=fedgen_cfg.get("distill_alpha", 0.7),
+            distill_steps=fedgen_cfg.get("distill_steps", 5),
+            distill_alpha=fedgen_cfg.get("distill_alpha", 1.0),
+            distill_beta=fedgen_cfg.get("distill_beta", 0.1),
+            distill_every=fedgen_cfg.get("distill_every", 2),
         )
         self.fedgen_gen_epochs = fedgen_cfg.get("gen_epochs", 1)
         self.fedgen_teacher_iters = fedgen_cfg.get("teacher_iters", 20)
@@ -326,8 +328,13 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self._generator_trained = True
         logger.info(f"Generator trained with {len(torch_models)} models")
 
-        # Server-side knowledge distillation (after warmup)
-        if server_round > FEDGEN_WARMUP_ROUNDS:
+        # Server-side knowledge distillation (after warmup, periodic)
+        distill_every = self.fedgen_distiller.distill_every
+        rounds_since_warmup = server_round - FEDGEN_WARMUP_ROUNDS
+        if (
+            server_round > FEDGEN_WARMUP_ROUNDS
+            and rounds_since_warmup % distill_every == 0
+        ):
             distill_losses = self.fedgen_distiller.distill_models(
                 models=torch_models,
                 label_weights=label_weights,
