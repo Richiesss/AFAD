@@ -8,6 +8,9 @@ HeteroFL（同族間の部分重み共有）と FedGen（異種間の Data-Free 
 - **ハイブリッド集約戦略**
   - **同族間 (Intra-Family)**: HeteroFL による部分的重み共有（例: ResNet50 ↔ ResNet18）
   - **異種間 (Inter-Family)**: FedGen による Generator ベースの Data-Free KD（例: CNN ↔ ViT）
+- **サーバーサイド知識蒸留**
+  - EMA ブレンディング（β=0.1）で実データ訓練の重みを保護しつつ知識を転写
+  - 品質ゲートにより低品質な合成データでの蒸留を自動スキップ
 - **5 種類の異種モデルをサポート**
   - CNN Family: ResNet50, ResNet18, MobileNetV3-Large
   - ViT Family: ViT-Tiny, DeiT-Small
@@ -16,21 +19,26 @@ HeteroFL（同族間の部分重み共有）と FedGen（異種間の Data-Free 
 
 ## Phase 1 実験結果
 
-MNIST・IID 分布・5 クライアント・20 ラウンドでの結果:
+MNIST・IID 分布・5 クライアント・20 ラウンドでの 3 方式比較:
 
-| 指標 | 値 |
-|------|-----|
-| 最終精度 | **96.69%** |
-| 最終損失 | 0.158 |
-| 95% 到達ラウンド | Round 11 |
-| 総実行時間 | 約 10.8 分 (RTX 4090) |
+| 方式 | Best Accuracy | Final Accuracy |
+|------|:---:|:---:|
+| HeteroFL Only | 94.09% | 93.89% |
+| **FedGen Only** | **94.33%** | **94.33%** |
+| AFAD Hybrid | 93.94% | 93.82% |
 
 精度推移:
 
 ```
-Round  1: 64.4%  ─  Round  5: 85.3%  ─  Round 10: 94.7%
-Round 11: 95.9%  ─  Round 15: 95.9%  ─  Round 20: 96.7%
+         HeteroFL Only    FedGen Only    AFAD Hybrid
+Round 1:     49.52%          49.64%        47.67%
+Round 5:     89.79%          88.81%        88.36%
+Round 10:    92.41%          93.14%        92.95%
+Round 15:    93.37%          93.24%        93.82%
+Round 20:    93.89%          94.33%        93.82%
 ```
+
+> **Note**: 5 つの固有アーキテクチャ構成では、各クライアントが独自の signature グループを形成するため、HeteroFL 集約は単純コピーに退化する。FedGen による知識蒸留が異種モデル間の唯一の知識共有メカニズムとして機能し、HeteroFL Only と同等以上の精度を達成している。
 
 ## 動作環境
 
@@ -68,14 +76,16 @@ experiment:
 
 server:
   min_clients: 5          # 参加クライアント数
-  min_fit_clients: 5      # 学習に参加する最小クライアント数
 
 strategy:
   fedgen:
-    temperature: 4.0      # KD 温度パラメータ
-    gen_steps: 10          # Generator 学習ステップ数/ラウンド
-    distill_steps: 3       # 蒸留ステップ数/ラウンド
+    gen_epochs: 2          # Generator 学習エポック数/ラウンド
+    teacher_iters: 25      # Teacher イテレーション数/エポック
+    temperature: 4.0       # KD 温度パラメータ
     distill_lr: 0.0001     # 蒸留学習率
+    distill_steps: 5       # 蒸留ステップ数/ラウンド
+    distill_beta: 0.1      # EMA ブレンディング係数
+    distill_every: 2       # 蒸留頻度（N ラウンドに 1 回）
 
 training:
   local_epochs: 2         # クライアントのローカル学習エポック数
@@ -86,7 +96,11 @@ training:
 ### 2. シミュレーション実行
 
 ```bash
+# 単一方式の実験
 uv run python scripts/run_experiment.py
+
+# 3 方式比較実験 (HeteroFL Only / FedGen Only / AFAD Hybrid)
+uv run python scripts/run_comparison.py
 ```
 
 実行すると以下が自動で行われる:
@@ -95,45 +109,49 @@ uv run python scripts/run_experiment.py
 2. 各クライアントに異種モデルを割当 (ResNet50, MobileNetV3, ResNet18, ViT-Tiny, DeiT-Small)
 3. 各ラウンドで:
    - **Local Training**: 各クライアントがローカルデータで学習
-   - **HeteroFL Aggregation**: 同じアーキテクチャ内で重みを集約
-   - **FedGen Distillation** (Round 4〜): Generator 学習 → 全モデルへの知識蒸留
+   - **HeteroFL Aggregation**: 同じ signature 内で重みを集約
+   - **FedGen** (Round 4〜):
+     - Phase 1: Generator 学習（アンサンブル一致を最大化）
+     - Phase 2: サーバーサイド知識蒸留（EMA ブレンディング付き）
    - **Evaluation**: テストデータで全クライアントの精度を評価
-4. 最終サマリを出力
+4. 最終サマリ・比較テーブルを出力
 
 ### 3. ログの見方
 
 実行中、各ラウンドのメトリクスがリアルタイムで表示される:
 
 ```
-Round  1: loss=0.9552, accuracy=0.6438, clients=5, time=33.0s
-Round  2: loss=0.3957, accuracy=0.8685, clients=5, time=30.5s
+Round  1: loss=1.3706, accuracy=0.4964, clients=5, time=156.4s
+Round  2: loss=0.7811, accuracy=0.7382, clients=5, time=152.2s
 ...
-Experiment Summary:
-  best_accuracy: 0.9669
-  final_accuracy: 0.9669
-  final_loss: 0.1583
-  total_wall_time: 645.4307
+Generator quality check passed: ensemble_acc=100.00%
+Distilled 5 models, avg_loss=0.0479
+...
+Round 20: loss=0.2807, accuracy=0.9433, clients=5, time=151.7s
 ```
 
 ## アーキテクチャ
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Flower Server                         │
-│                                                          │
-│  AFADStrategy                                            │
-│  ├── configure_fit()    クライアントごとのモデル配信      │
-│  ├── aggregate_fit()    HeteroFL + FedGen 集約           │
-│  │   ├── HeteroFLAggregator   同族間: 重み平均           │
-│  │   └── FedGenDistiller      異種間: KD 蒸留            │
-│  │       ├── Phase 1: Generator 学習                     │
-│  │       └── Phase 2: Ensemble → 各モデル KD             │
+┌──────────────────────────────────────────────────────────┐
+│                    Flower Server                          │
+│                                                           │
+│  AFADStrategy                                             │
+│  ├── configure_fit()    クライアントごとのモデル配信       │
+│  ├── aggregate_fit()    HeteroFL + FedGen 集約            │
+│  │   ├── HeteroFLAggregator   同族間: 重み平均            │
+│  │   └── FedGenDistiller      異種間: サーバーサイド KD   │
+│  │       ├── Phase 1: Generator 学習                      │
+│  │       │   L = α·L_teacher + η·L_diversity              │
+│  │       ├── Phase 2: 品質ゲート (ensemble_acc ≥ 40%)     │
+│  │       └── Phase 3: EMA 付き KD 蒸留                    │
+│  │           new = (1-β)·original + β·distilled           │
 │  ├── configure_evaluate()  各クライアントに自身のモデル送信│
-│  └── aggregate_evaluate()  加重平均で精度集約             │
-│                                                          │
-│  SyntheticGenerator (MNIST 正規化済み合成画像生成)        │
-│  MetricsCollector   (ラウンドごとの精度・損失・時間記録)  │
-└──────────────────────┬──────────────────────────────────┘
+│  └── aggregate_evaluate()  加重平均で精度集約              │
+│                                                           │
+│  SyntheticGenerator (MNIST 正規化済み合成画像生成)         │
+│  MetricsCollector   (ラウンドごとの精度・損失・時間記録)   │
+└──────────────────────┬────────────────────────────────────┘
                        │ Flower Protocol
     ┌──────────────────┼──────────────────┐
     │                  │                  │
@@ -151,7 +169,8 @@ AFAD/
 ├── config/
 │   └── afad_config.yaml          # 実験設定
 ├── scripts/
-│   ├── run_experiment.py         # Flower Simulation 実行スクリプト
+│   ├── run_experiment.py         # 単一実験スクリプト
+│   ├── run_comparison.py         # 3 方式比較スクリプト
 │   └── debug_integration.py      # 手動統合テスト
 ├── src/
 │   ├── client/
@@ -170,18 +189,18 @@ AFAD/
 │   │   └── family_router.py      # モデルファミリー判定
 │   ├── server/
 │   │   ├── generator/
-│   │   │   └── synthetic_generator.py  # 合成画像 Generator (EMA 付き)
+│   │   │   └── synthetic_generator.py  # 合成画像 Generator
 │   │   └── strategy/
 │   │       ├── afad_strategy.py        # AFAD 統合戦略
 │   │       ├── heterofl_aggregator.py  # HeteroFL 同族間集約
-│   │       └── fedgen_distiller.py     # FedGen 異種間蒸留
+│   │       └── fedgen_distiller.py     # FedGen サーバーサイド蒸留
 │   └── utils/
 │       ├── config_loader.py      # YAML 設定読み込み
 │       ├── logger.py             # ロガー
 │       └── metrics.py            # MetricsCollector
-├── tests/                        # テスト (35 件)
+├── tests/                        # テスト (58 件)
 │   ├── test_integration.py       # E2E 統合テスト
-│   ├── test_fedgen_distiller.py  # FedGen 蒸留テスト
+│   ├── test_fedgen_distiller.py  # FedGen 蒸留テスト (EMA 含む)
 │   ├── test_heterofl_aggregator.py  # HeteroFL 集約テスト
 │   ├── test_generator.py         # Generator テスト
 │   ├── test_metrics.py           # MetricsCollector テスト
@@ -217,24 +236,36 @@ uv run poe all    # lint + test
 
 ## 技術的な補足
 
-### なぜ HeteroFL + FedGen のハイブリッドか
+### サーバーサイド知識蒸留
 
-5 つの異種アーキテクチャでは、各クライアントが固有のパラメータ構造（signature）を持つため、HeteroFL 集約は単純コピーに退化する（1 グループ 1 クライアント）。
-**FedGen による Data-Free KD が、異種モデル間の唯一の知識共有メカニズム** として機能する。
-
-### FedGen の動作
+AFAD は FedGen (Zhu et al., ICML 2021) をサーバーサイドに適応している。
+クライアント側での蒸留は合成データの品質問題により精度が不安定になるため、蒸留をサーバー側で行い、以下の安定化機構を導入した:
 
 1. **Generator Training**: 合成画像をモデルアンサンブルに入力し、一貫した予測を生成するよう Generator を学習
-2. **Knowledge Distillation**: アンサンブルの soft logits を教師として、KL ダイバージェンス (温度スケーリング付き) で各モデルに知識を転写
+2. **品質ゲート**: アンサンブルが合成画像を 40% 以上正しく分類できない場合、蒸留をスキップ
+3. **Knowledge Distillation**: アンサンブルの soft logits を教師として、KL ダイバージェンスで各モデルに知識を転写
 
 ```
-KD_loss = T² × KL(softmax(student/T) ‖ softmax(teacher/T))
+KD_loss = KL(softmax(student/T) ‖ softmax(teacher/T))
 ```
+
+4. **EMA ブレンディング**: 蒸留後の重みを元の重みと混合し、実データ訓練の成果を保護
+
+```
+new_weights = (1 - β) × original_weights + β × distilled_weights  (β=0.1)
+```
+
+5. **周期的蒸留**: 毎ラウンドではなく 2 ラウンドに 1 回蒸留を実行し、累積的な劣化を防止
 
 ### FedGen Warmup
 
 FedGen 蒸留は Round 4 から開始（3 ラウンドの warmup）。
 初期ラウンドでローカル学習を十分に行い、モデルが意味のある特徴を獲得してから蒸留を開始することで、学習の不安定化を防ぐ。
+
+### 参考文献
+
+- Diao, E. et al. "HeteroFL: Computation and Communication Efficient Federated Learning for Heterogeneous Clients" (ICLR 2021)
+- Zhu, Z. et al. "Data-Free Knowledge Distillation for Heterogeneous Federated Learning" (ICML 2021)
 
 ## 開発者
 
