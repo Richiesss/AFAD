@@ -80,3 +80,31 @@ class TestSyntheticGenerator:
             labels = torch.randint(0, 10, (batch_size,))
             result = self.generator(labels)
             assert result["output"].shape == (batch_size, 1, 28, 28)
+
+    def test_custom_mean_std(self):
+        """Generator with custom mean/std should normalize accordingly."""
+        custom_mean = 0.468
+        custom_std = 0.297
+        gen = SyntheticGenerator(
+            noise_dim=32,
+            num_classes=11,
+            hidden_dim=256,
+            mean=custom_mean,
+            std=custom_std,
+        )
+        assert gen.mean == custom_mean
+        assert gen.std == custom_std
+
+        labels = torch.randint(0, 11, (16,))
+        result = gen(labels)
+        images = result["output"]
+        expected_min = (0.0 - custom_mean) / custom_std
+        expected_max = (1.0 - custom_mean) / custom_std
+        assert torch.all(images >= expected_min - 1e-5)
+        assert torch.all(images <= expected_max + 1e-5)
+
+    def test_default_mean_std_matches_mnist(self):
+        """Default mean/std should match MNIST constants."""
+        gen = SyntheticGenerator()
+        assert gen.mean == MNIST_MEAN
+        assert gen.std == MNIST_STD

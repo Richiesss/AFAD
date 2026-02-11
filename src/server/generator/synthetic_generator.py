@@ -25,6 +25,8 @@ class SyntheticGenerator(nn.Module):
         num_classes: int = 10,
         hidden_dim: int = 256,
         output_shape: tuple = (1, 28, 28),
+        mean: float = 0.1307,
+        std: float = 0.3081,
         # Legacy parameter kept for backward compatibility
         latent_dim: int | None = None,
     ):
@@ -33,6 +35,8 @@ class SyntheticGenerator(nn.Module):
         self.num_classes = num_classes
         self.hidden_dim = hidden_dim
         self.output_shape = output_shape
+        self.mean = mean
+        self.std = std
         # Legacy alias
         self.latent_dim = latent_dim if latent_dim is not None else noise_dim
 
@@ -97,7 +101,7 @@ class SyntheticGenerator(nn.Module):
         # Sigmoid to [0, 1] range, then MNIST normalization
         z = torch.sigmoid(z)
         images = z.view(-1, *self.output_shape)
-        images = (images - MNIST_MEAN) / MNIST_STD
+        images = (images - self.mean) / self.std
 
         return {"output": images, "eps": eps}
 

@@ -1,0 +1,77 @@
+experiment:
+  name: "AFAD_OrganAMNIST_Phase2"
+  seed: 42
+  num_rounds: 40
+
+server:
+  address: "0.0.0.0:8080"
+  min_clients: 10
+  min_fit_clients: 10
+
+strategy:
+  type: "AFAD"
+  intra_family: "heterofl"
+  inter_family: "fedgen"
+  generator:
+    noise_dim: 32
+    hidden_dim: 256
+  fedgen:
+    gen_lr: 0.0003
+    batch_size: 128
+    ensemble_alpha: 1.0
+    ensemble_eta: 1.0
+    gen_epochs: 2
+    teacher_iters: 25
+    temperature: 4.0
+    distill_lr: 0.0001
+    distill_epochs: 1
+    distill_steps: 5
+    distill_alpha: 1.0
+    distill_beta: 0.1
+    distill_every: 2
+
+# 10 clients: 5 architectures x 2 clients each
+# CID 0,1 -> resnet50 (CNN)
+# CID 2,3 -> mobilenetv3_large (CNN)
+# CID 4,5 -> resnet18 (CNN)
+# CID 6,7 -> vit_tiny (ViT)
+# CID 8,9 -> deit_small (ViT)
+clients:
+  - id: "client_0"
+    model: "resnet50"
+  - id: "client_1"
+    model: "resnet50"
+  - id: "client_2"
+    model: "mobilenetv3_large"
+  - id: "client_3"
+    model: "mobilenetv3_large"
+  - id: "client_4"
+    model: "resnet18"
+  - id: "client_5"
+    model: "resnet18"
+  - id: "client_6"
+    model: "vit_tiny"
+  - id: "client_7"
+    model: "vit_tiny"
+  - id: "client_8"
+    model: "deit_small"
+  - id: "client_9"
+    model: "deit_small"
+
+data:
+  dataset: "organamnist"
+  num_classes: 11
+  distribution: "non_iid"
+  dirichlet_alpha: 0.5
+  batch_size: 64
+
+training:
+  local_epochs: 3
+  learning_rate: 0.01
+  optimizer: "sgd"
+  momentum: 0.9
+  weight_decay: 0.0001
+
+evaluation:
+  metrics: ["accuracy", "f1_score", "communication_cost"]
+  eval_every: 1

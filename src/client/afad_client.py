@@ -33,6 +33,7 @@ class AFADClient(fl.client.NumPyClient):
         lr: float = 0.01,
         momentum: float = 0.9,
         weight_decay: float = 0.0001,
+        num_classes: int = 10,
     ):
         self.cid = cid
         self.model = model
@@ -47,6 +48,7 @@ class AFADClient(fl.client.NumPyClient):
         self.lr = lr
         self.momentum = momentum
         self.weight_decay = weight_decay
+        self.num_classes = num_classes
 
         # Precompute label counts from training data
         self.label_counts = self._compute_label_counts()
@@ -58,7 +60,7 @@ class AFADClient(fl.client.NumPyClient):
 
     def _compute_label_counts(self) -> list[int]:
         """Count per-class samples in training data (computed once)."""
-        counts = [0] * 10  # MNIST: 10 classes
+        counts = [0] * self.num_classes
         for _, labels in self.train_loader:
             for label in labels:
                 counts[label.item()] += 1

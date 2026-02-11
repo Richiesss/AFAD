@@ -57,6 +57,7 @@ data:
   dataset: "mnist"              # Phase1: mnist, Phase2: medmnist
   num_classes: 10
   distribution: "iid"           # iid | non_iid
+  dirichlet_alpha: 0.5          # Dirichlet concentration (non_iid only)
   batch_size: 64
 
 training:

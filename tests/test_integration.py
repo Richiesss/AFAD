@@ -40,19 +40,19 @@ class _MockClientProxy(ClientProxy):
         return None
 
 
-def _build_strategy(enable_fedgen: bool = True) -> AFADStrategy:
+def _build_strategy(enable_fedgen: bool = True, num_classes: int = 10) -> AFADStrategy:
     """Create an AFADStrategy with model factories for ResNet18 and ViT-Tiny."""
-    generator = SyntheticGenerator(noise_dim=32, num_classes=10, hidden_dim=64)
+    generator = SyntheticGenerator(noise_dim=32, num_classes=num_classes, hidden_dim=64)
     router = FamilyRouter()
     model_factories = {
-        "resnet18": lambda num_classes=10: ModelRegistry.create_model(
+        "resnet18": lambda num_classes=num_classes: ModelRegistry.create_model(
             "resnet18", num_classes=num_classes
         ),
-        "vit_tiny": lambda num_classes=10: ModelRegistry.create_model(
+        "vit_tiny": lambda num_classes=num_classes: ModelRegistry.create_model(
             "vit_tiny", num_classes=num_classes
         ),
     }
-    initial_model = ModelRegistry.create_model("resnet18", num_classes=10)
+    initial_model = ModelRegistry.create_model("resnet18", num_classes=num_classes)
     initial_params = ndarrays_to_parameters(
         [val.cpu().numpy() for val in initial_model.state_dict().values()]
     )
@@ -62,6 +62,7 @@ def _build_strategy(enable_fedgen: bool = True) -> AFADStrategy:
         family_router=router,
         model_factories=model_factories,
         enable_fedgen=enable_fedgen,
+        num_classes=num_classes,
         fedgen_config={
             "gen_lr": 1e-3,
             "batch_size": 8,
@@ -253,3 +254,71 @@ class TestIntegration:
 
         strategy.aggregate_fit(1, results, failures=[])
         assert not strategy._generator_trained
+
+
+class TestIntegration11Classes:
+    """Test with num_classes=11 (OrganAMNIST-like)."""
+
+    def setup_method(self):
+        self.strategy = _build_strategy(num_classes=11)
+        self.train_loaders, self.test_loader = load_mnist_data(
+            num_clients=2, batch_size=8, max_samples=200
+        )
+
+    def test_11_class_pipeline(self):
+        """Run 1 round with 11-class models to verify num_classes propagation."""
+        client_cnn = AFADClient(
+            cid="0",
+            model=ModelRegistry.create_model("resnet18", num_classes=11),
+            train_loader=self.train_loaders[0],
+            epochs=1,
+            device="cpu",
+            family="cnn",
+            model_name="resnet18",
+            num_classes=11,
+        )
+        client_vit = AFADClient(
+            cid="1",
+            model=ModelRegistry.create_model("vit_tiny", num_classes=11),
+            train_loader=self.train_loaders[1],
+            epochs=1,
+            device="cpu",
+            family="vit",
+            model_name="vit_tiny",
+            num_classes=11,
+        )
+
+        results = []
+        for cid, client in [("0", client_cnn), ("1", client_vit)]:
+            params, num_ex, metrics = client.fit([], {"use_local_init": True})
+            proxy = _MockClientProxy(cid)
+            results.append(
+                (
+                    proxy,
+                    FitRes(
+                        status=Status(code=Code.OK, message="ok"),
+                        parameters=ndarrays_to_parameters(params),
+                        num_examples=num_ex,
+                        metrics=metrics,
+                    ),
+                )
+            )
+
+        agg_params, agg_metrics = self.strategy.aggregate_fit(1, results, failures=[])
+        assert agg_params is not None
+        assert agg_metrics["total_clients"] == 2
+
+    def test_11_class_label_counts(self):
+        """Client with num_classes=11 should produce 11-element label_counts."""
+        client = AFADClient(
+            cid="0",
+            model=ModelRegistry.create_model("resnet18", num_classes=11),
+            train_loader=self.train_loaders[0],
+            epochs=1,
+            device="cpu",
+            model_name="resnet18",
+            num_classes=11,
+        )
+        params, num_ex, metrics = client.fit([], {"use_local_init": True})
+        counts = [int(x) for x in metrics["label_counts"].split(",")]
+        assert len(counts) == 11

@@ -58,6 +58,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         training_config: dict[str, Any] | None = None,
         enable_fedgen: bool = True,
         num_rounds: int = 20,
+        num_classes: int = 10,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -66,6 +67,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self.model_factories = model_factories or {}
         self.enable_fedgen = enable_fedgen
         self.num_rounds = num_rounds
+        self.num_classes = num_classes
 
         # Per-signature global models (stored as numpy arrays)
         self.global_models: dict[str, list[np.ndarray]] = {}
@@ -292,7 +294,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         for sig, np_params in self.global_models.items():
             model_name = self.sig_to_model_name.get(sig)
             if model_name and model_name in self.model_factories:
-                model = self.model_factories[model_name](num_classes=10)
+                model = self.model_factories[model_name](num_classes=self.num_classes)
                 state_dict = model.state_dict()
                 keys = list(state_dict.keys())
                 if len(keys) == len(np_params):
@@ -320,11 +322,11 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         if not label_counts_list:
             # Fallback: uniform weights
             num_models = len(torch_models)
-            label_weights = np.ones((10, num_models)) / num_models
-            qualified_labels = list(range(10))
+            label_weights = np.ones((self.num_classes, num_models)) / num_models
+            qualified_labels = list(range(self.num_classes))
         else:
             label_weights, qualified_labels = self.fedgen_distiller.get_label_weights(
-                label_counts_list
+                label_counts_list, num_classes=self.num_classes
             )
 
         # Train generator

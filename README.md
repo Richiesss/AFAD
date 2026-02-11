@@ -43,6 +43,34 @@ Round 40:    95.56%          95.31%        95.48%
 
 > **Note**: 5 つの固有アーキテクチャ構成では、各クライアントが独自の signature グループを形成するため、HeteroFL 集約は単純コピーに退化する。FedGen による知識蒸留が異種モデル間の唯一の知識共有メカニズムとして機能している。3 方式とも 95% 以上の精度に収束し、安定した学習曲線を示す。
 
+## Phase 2 実験結果
+
+OrganAMNIST（11 クラス臓器分類）・Non-IID 分布（Dirichlet α=0.5）・10 クライアント（5 アーキテクチャ × 2）・40 ラウンド・Cosine LR:
+
+| 方式 | Best Accuracy | Final Accuracy | Final Loss | Total Time |
+|------|:---:|:---:|:---:|:---:|
+| HeteroFL Only | 70.88% | 70.73% | 1.4949 | 1,514s |
+| FedGen Only | 70.85% | 70.75% | 1.4407 | 1,683s |
+| **AFAD Hybrid** | **71.55%** | **71.37%** | **1.4320** | 1,666s |
+
+精度推移:
+
+```
+         HeteroFL Only    FedGen Only    AFAD Hybrid
+Round  1:    13.85%          15.14%        14.42%
+Round  5:    46.20%          45.52%        47.04%
+Round 10:    61.93%          60.55%        62.41%
+Round 20:    69.11%          68.18%        69.56%
+Round 30:    70.73%          70.58%        71.34%
+Round 40:    70.73%          70.75%        71.37%
+```
+
+> **Phase 2 の主な知見**:
+> - **AFAD Hybrid が一貫して最高精度を達成** — Best/Final ともに HeteroFL Only を約 +0.6pt 上回る
+> - Non-IID 環境で HeteroFL + FedGen の相補的効果が顕在化（Phase 1 の IID 環境では3方式ほぼ同等だった）
+> - FedGen の知識蒸留はロスの低減に特に効果的（HeteroFL: 1.495 → AFAD: 1.432）
+> - 10 クライアント（各アーキテクチャ 2 台）により HeteroFL のグループ内集約が有効に機能
+
 ## 動作環境
 
 - Python 3.10+
@@ -102,8 +130,11 @@ training:
 # 単一方式の実験
 uv run python scripts/run_experiment.py
 
-# 3 方式比較実験 (HeteroFL Only / FedGen Only / AFAD Hybrid)
+# 3 方式比較実験 - Phase 1 (MNIST, IID, 5 clients)
 uv run python scripts/run_comparison.py
+
+# 3 方式比較実験 - Phase 2 (OrganAMNIST, Non-IID, 10 clients)
+uv run python scripts/run_comparison.py config/afad_phase2_config.yaml
 ```
 
 実行すると以下が自動で行われる:
@@ -170,7 +201,8 @@ Round 40: loss=0.1851, accuracy=0.9531, clients=5, time=55.3s
 ```
 AFAD/
 ├── config/
-│   └── afad_config.yaml          # 実験設定
+│   ├── afad_config.yaml          # Phase 1 実験設定 (MNIST)
+│   └── afad_phase2_config.yaml   # Phase 2 実験設定 (OrganAMNIST)
 ├── scripts/
 │   ├── run_experiment.py         # 単一実験スクリプト
 │   ├── run_comparison.py         # 3 方式比較スクリプト
@@ -179,7 +211,9 @@ AFAD/
 │   ├── client/
 │   │   └── afad_client.py        # FL クライアント (NumPyClient)
 │   ├── data/
-│   │   └── mnist_loader.py       # MNIST データローダー・分割
+│   │   ├── dataset_config.py     # データセット設定レジストリ
+│   │   ├── mnist_loader.py       # MNIST データローダー (Phase 1)
+│   │   └── medmnist_loader.py    # OrganAMNIST データローダー + Dirichlet 分割 (Phase 2)
 │   ├── models/
 │   │   ├── registry.py           # モデルレジストリ (ファクトリパターン)
 │   │   ├── cnn/
@@ -201,11 +235,13 @@ AFAD/
 │       ├── config_loader.py      # YAML 設定読み込み
 │       ├── logger.py             # ロガー
 │       └── metrics.py            # MetricsCollector
-├── tests/                        # テスト (58 件)
-│   ├── test_integration.py       # E2E 統合テスト
+├── tests/                        # テスト (77 件)
+│   ├── test_integration.py       # E2E 統合テスト (5/11 クラス)
 │   ├── test_fedgen_distiller.py  # FedGen 蒸留テスト (EMA 含む)
 │   ├── test_heterofl_aggregator.py  # HeteroFL 集約テスト
 │   ├── test_generator.py         # Generator テスト
+│   ├── test_medmnist_loader.py   # Dirichlet 分割テスト
+│   ├── test_dataset_config.py    # データセット設定テスト
 │   ├── test_metrics.py           # MetricsCollector テスト
 │   └── test_router.py            # FamilyRouter テスト
 ├── pyproject.toml                # プロジェクト設定・依存関係

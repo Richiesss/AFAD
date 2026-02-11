@@ -12,6 +12,7 @@ import src.models.cnn.resnet  # noqa: F401
 import src.models.vit.deit  # noqa: F401
 import src.models.vit.vit  # noqa: F401
 from src.client.afad_client import AFADClient
+from src.data.dataset_config import get_dataset_config
 from src.data.mnist_loader import load_mnist_data
 from src.models.registry import ModelRegistry
 from src.routing.family_router import FamilyRouter
@@ -26,8 +27,8 @@ device_type = "cuda" if torch.cuda.is_available() else "cpu"
 num_gpus = 0.15 if device_type == "cuda" else 0.0
 CLIENT_RESOURCES = {"num_cpus": 1.0, "num_gpus": num_gpus}
 
-# Fixed client-model mapping for Phase 1
-CID_TO_MODEL = {
+# Phase 1: 5 clients, 5 unique architectures
+CID_TO_MODEL_5 = {
     "0": "resnet50",
     "1": "mobilenetv3_large",
     "2": "resnet18",
@@ -35,7 +36,7 @@ CID_TO_MODEL = {
     "4": "deit_small",
 }
 
-CID_TO_FAMILY = {
+CID_TO_FAMILY_5 = {
     "0": "cnn",
     "1": "cnn",
     "2": "cnn",
@@ -43,24 +44,68 @@ CID_TO_FAMILY = {
     "4": "vit",
 }
 
+# Phase 2: 10 clients, 5 architectures x 2
+CID_TO_MODEL_10 = {
+    "0": "resnet50",
+    "1": "resnet50",
+    "2": "mobilenetv3_large",
+    "3": "mobilenetv3_large",
+    "4": "resnet18",
+    "5": "resnet18",
+    "6": "vit_tiny",
+    "7": "vit_tiny",
+    "8": "deit_small",
+    "9": "deit_small",
+}
+
+CID_TO_FAMILY_10 = {
+    "0": "cnn",
+    "1": "cnn",
+    "2": "cnn",
+    "3": "cnn",
+    "4": "cnn",
+    "5": "cnn",
+    "6": "vit",
+    "7": "vit",
+    "8": "vit",
+    "9": "vit",
+}
+
 
 def get_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def build_model_factories() -> dict[str, callable]:
+def get_client_mappings(
+    num_clients: int,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return (cid_to_model, cid_to_family) for the given client count."""
+    if num_clients <= 5:
+        return CID_TO_MODEL_5, CID_TO_FAMILY_5
+    return CID_TO_MODEL_10, CID_TO_FAMILY_10
+
+
+def build_model_factories(
+    cid_to_model: dict[str, str],
+) -> dict[str, callable]:
     """Build factory functions for each model used in the experiment."""
-    model_names = set(CID_TO_MODEL.values())
+    model_names = set(cid_to_model.values())
     factories = {}
     for name in model_names:
-        # Capture name in closure properly
         factories[name] = lambda num_classes=10, _n=name: ModelRegistry.create_model(
             _n, num_classes=num_classes
         )
     return factories
 
 
-def client_fn_builder(train_loaders, test_loader, config):
+def client_fn_builder(
+    train_loaders,
+    test_loader,
+    config,
+    cid_to_model: dict[str, str],
+    cid_to_family: dict[str, str],
+    num_classes: int,
+):
     """Closure to create client_fn with access to data loaders."""
 
     def client_fn(cid: str) -> fl.client.Client:
@@ -70,11 +115,11 @@ def client_fn_builder(train_loaders, test_loader, config):
         import src.models.vit.deit  # noqa: F401
         import src.models.vit.vit  # noqa: F401
 
-        model_name = CID_TO_MODEL.get(cid, "resnet18")
-        family = CID_TO_FAMILY.get(cid, "cnn")
+        model_name = cid_to_model.get(cid, "resnet18")
+        family = cid_to_family.get(cid, "cnn")
         device = get_device()
 
-        model = ModelRegistry.create_model(model_name, num_classes=10)
+        model = ModelRegistry.create_model(model_name, num_classes=num_classes)
 
         client_id_int = int(cid)
         train_loader = train_loaders[client_id_int % len(train_loaders)]
@@ -93,6 +138,7 @@ def client_fn_builder(train_loaders, test_loader, config):
             lr=training_cfg.get("learning_rate", 0.01),
             momentum=training_cfg.get("momentum", 0.9),
             weight_decay=training_cfg.get("weight_decay", 0.0001),
+            num_classes=num_classes,
         ).to_client()
 
     return client_fn
@@ -112,13 +158,34 @@ def evaluate_metrics_aggregation_fn(
 def main():
     from src.utils.config_loader import load_config
 
-    config_dict = load_config("config/afad_config.yaml")
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "config/afad_config.yaml"
+    config_dict = load_config(config_path)
 
-    # Data
-    train_loaders, test_loader = load_mnist_data(
-        num_clients=config_dict["server"]["min_clients"],
-        batch_size=config_dict["data"]["batch_size"],
-    )
+    # Dataset config
+    dataset_name = config_dict["data"].get("dataset", "mnist")
+    ds_cfg = get_dataset_config(dataset_name)
+    num_classes = ds_cfg.num_classes
+    num_clients = config_dict["server"]["min_clients"]
+
+    # Client mappings
+    cid_to_model, cid_to_family = get_client_mappings(num_clients)
+
+    # Data loading
+    if dataset_name == "organamnist":
+        from src.data.medmnist_loader import load_organamnist_data
+
+        data_cfg = config_dict["data"]
+        train_loaders, test_loader = load_organamnist_data(
+            num_clients=num_clients,
+            batch_size=data_cfg.get("batch_size", 64),
+            alpha=data_cfg.get("dirichlet_alpha", 0.5),
+            distribution=data_cfg.get("distribution", "non_iid"),
+        )
+    else:
+        train_loaders, test_loader = load_mnist_data(
+            num_clients=num_clients,
+            batch_size=config_dict["data"]["batch_size"],
+        )
 
     # Strategy components
     family_router = FamilyRouter()
@@ -127,18 +194,20 @@ def main():
 
     generator = SyntheticGenerator(
         noise_dim=32,
-        num_classes=10,
+        num_classes=num_classes,
         hidden_dim=256,
+        mean=ds_cfg.mean[0],
+        std=ds_cfg.std[0],
     )
 
     # Initial parameters (dummy for Flower)
-    initial_model = ModelRegistry.create_model("resnet18", num_classes=10)
+    initial_model = ModelRegistry.create_model("resnet18", num_classes=num_classes)
     initial_params = fl.common.ndarrays_to_parameters(
         [val.cpu().numpy() for val in initial_model.state_dict().values()]
     )
 
     # Model factories for FedGen reconstruction
-    model_factories = build_model_factories()
+    model_factories = build_model_factories(cid_to_model)
 
     # FedGen config
     fedgen_config = {
@@ -155,7 +224,7 @@ def main():
         "distill_alpha": fedgen_yaml.get("distill_alpha", 1.0),
         "distill_beta": fedgen_yaml.get("distill_beta", 0.1),
         "distill_every": fedgen_yaml.get("distill_every", 2),
-        "device": get_device(),  # Use GPU for generator/distillation (Ray actors idle during aggregation)
+        "device": get_device(),
     }
 
     # Training config to propagate to clients
@@ -177,6 +246,7 @@ def main():
         fedgen_config=fedgen_config,
         training_config=training_config,
         num_rounds=num_rounds,
+        num_classes=num_classes,
         min_fit_clients=config_dict["server"]["min_fit_clients"],
         min_available_clients=config_dict["server"]["min_clients"],
         fraction_fit=1.0,
@@ -186,11 +256,21 @@ def main():
     )
 
     # Simulation
-    logger.info(f"Starting AFAD simulation: {num_rounds} rounds")
+    logger.info(
+        f"Starting AFAD simulation: {num_rounds} rounds, "
+        f"dataset={dataset_name}, clients={num_clients}"
+    )
 
     fl.simulation.start_simulation(
-        client_fn=client_fn_builder(train_loaders, test_loader, config_dict),
-        num_clients=config_dict["server"]["min_clients"],
+        client_fn=client_fn_builder(
+            train_loaders,
+            test_loader,
+            config_dict,
+            cid_to_model,
+            cid_to_family,
+            num_classes,
+        ),
+        num_clients=num_clients,
         config=fl.server.ServerConfig(num_rounds=num_rounds),
         strategy=strategy,
         client_resources=CLIENT_RESOURCES,
