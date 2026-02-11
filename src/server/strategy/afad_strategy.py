@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -56,6 +57,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         fedgen_config: dict[str, Any] | None = None,
         training_config: dict[str, Any] | None = None,
         enable_fedgen: bool = True,
+        num_rounds: int = 20,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -63,6 +65,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self.router = family_router
         self.model_factories = model_factories or {}
         self.enable_fedgen = enable_fedgen
+        self.num_rounds = num_rounds
 
         # Per-signature global models (stored as numpy arrays)
         self.global_models: dict[str, list[np.ndarray]] = {}
@@ -155,10 +158,18 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             if family:
                 new_config["family"] = family
 
-            # Propagate training config
-            for key in ("lr", "momentum", "weight_decay", "local_epochs"):
+            # Propagate training config with cosine LR scheduling
+            for key in ("momentum", "weight_decay", "local_epochs"):
                 if key in self.training_config:
                     new_config[key] = self.training_config[key]
+
+            # Cosine annealing: lr decays from lr_max to lr_min over num_rounds
+            base_lr = self.training_config.get("lr", 0.01)
+            lr_min = base_lr * 0.01  # Decay to 1% of initial LR
+            progress = server_round / self.num_rounds
+            new_config["lr"] = lr_min + 0.5 * (base_lr - lr_min) * (
+                1 + math.cos(math.pi * progress)
+            )
 
             # Send matching global model if available
             sig = self.client_model_signatures.get(cid)

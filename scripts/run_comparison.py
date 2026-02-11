@@ -30,9 +30,9 @@ logger = setup_logger("Comparison")
 
 # --- Experiment constants ---
 NUM_CLIENTS = 5
-NUM_ROUNDS = 20
+NUM_ROUNDS = 40
 BATCH_SIZE = 64
-LOCAL_EPOCHS = 2
+LOCAL_EPOCHS = 3
 SEED = 42
 
 CID_TO_MODEL = {
@@ -137,7 +137,7 @@ def run_single_experiment(
         "distill_alpha": 1.0,
         "distill_beta": 0.1,
         "distill_every": 2,
-        "device": "cpu",  # Server-side generator/distillation on CPU (GPU reserved for Ray actors)
+        "device": get_device(),  # Use GPU for generator/distillation (Ray actors idle during aggregation)
     }
 
     training_config = {
@@ -155,6 +155,7 @@ def run_single_experiment(
         fedgen_config=fedgen_config,
         training_config=training_config,
         enable_fedgen=enable_fedgen,
+        num_rounds=NUM_ROUNDS,
         min_fit_clients=NUM_CLIENTS,
         min_available_clients=NUM_CLIENTS,
         fraction_fit=1.0,

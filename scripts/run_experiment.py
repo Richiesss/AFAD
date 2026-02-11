@@ -155,7 +155,7 @@ def main():
         "distill_alpha": fedgen_yaml.get("distill_alpha", 1.0),
         "distill_beta": fedgen_yaml.get("distill_beta", 0.1),
         "distill_every": fedgen_yaml.get("distill_every", 2),
-        "device": "cpu",  # Server-side generator/distillation on CPU (GPU reserved for Ray actors)
+        "device": get_device(),  # Use GPU for generator/distillation (Ray actors idle during aggregation)
     }
 
     # Training config to propagate to clients
@@ -167,6 +167,8 @@ def main():
         "local_epochs": training_cfg.get("local_epochs", 1),
     }
 
+    num_rounds = config_dict["experiment"]["num_rounds"]
+
     strategy = AFADStrategy(
         initial_parameters=initial_params,
         initial_generator=generator,
@@ -174,6 +176,7 @@ def main():
         model_factories=model_factories,
         fedgen_config=fedgen_config,
         training_config=training_config,
+        num_rounds=num_rounds,
         min_fit_clients=config_dict["server"]["min_fit_clients"],
         min_available_clients=config_dict["server"]["min_clients"],
         fraction_fit=1.0,
@@ -183,7 +186,6 @@ def main():
     )
 
     # Simulation
-    num_rounds = config_dict["experiment"]["num_rounds"]
     logger.info(f"Starting AFAD simulation: {num_rounds} rounds")
 
     fl.simulation.start_simulation(

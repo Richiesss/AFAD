@@ -1,7 +1,7 @@
 experiment:
   name: "AFAD_MNIST_Phase1"
   seed: 42
-  num_rounds: 20
+  num_rounds: 40
 
 server:
   address: "0.0.0.0:8080"
@@ -60,7 +60,7 @@ data:
   batch_size: 64
 
 training:
-  local_epochs: 2
+  local_epochs: 3
   learning_rate: 0.01
   optimizer: "sgd"
   momentum: 0.9
