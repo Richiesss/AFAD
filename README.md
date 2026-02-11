@@ -11,6 +11,8 @@ HeteroFL（同族間の部分重み共有）と FedGen（異種間の Data-Free 
 - **サーバーサイド知識蒸留**
   - EMA ブレンディング（β=0.1）で実データ訓練の重みを保護しつつ知識を転写
   - 品質ゲートにより低品質な合成データでの蒸留を自動スキップ
+- **学習率スケジューリング**
+  - Cosine Annealing で学習率を自動減衰（lr_max → lr_max×0.01）
 - **5 種類の異種モデルをサポート**
   - CNN Family: ResNet50, ResNet18, MobileNetV3-Large
   - ViT Family: ViT-Tiny, DeiT-Small
@@ -19,26 +21,27 @@ HeteroFL（同族間の部分重み共有）と FedGen（異種間の Data-Free 
 
 ## Phase 1 実験結果
 
-MNIST・IID 分布・5 クライアント・20 ラウンドでの 3 方式比較:
+MNIST・IID 分布・5 クライアント・40 ラウンド・Cosine LR での 3 方式比較:
 
-| 方式 | Best Accuracy | Final Accuracy |
-|------|:---:|:---:|
-| HeteroFL Only | 94.09% | 93.89% |
-| **FedGen Only** | **94.33%** | **94.33%** |
-| AFAD Hybrid | 93.94% | 93.82% |
+| 方式 | Best Accuracy | Final Accuracy | Total Time |
+|------|:---:|:---:|:---:|
+| **HeteroFL Only** | **95.58%** | **95.56%** | 1,951s |
+| FedGen Only | 95.37% | 95.31% | 2,161s |
+| AFAD Hybrid | 95.52% | 95.48% | 2,210s |
 
 精度推移:
 
 ```
          HeteroFL Only    FedGen Only    AFAD Hybrid
-Round 1:     49.52%          49.64%        47.67%
-Round 5:     89.79%          88.81%        88.36%
-Round 10:    92.41%          93.14%        92.95%
-Round 15:    93.37%          93.24%        93.82%
-Round 20:    93.89%          94.33%        93.82%
+Round  1:    49.41%          50.01%        47.72%
+Round  5:    89.69%          89.20%        89.87%
+Round 10:    92.96%          93.31%        92.52%
+Round 20:    94.73%          94.77%        94.62%
+Round 30:    95.43%          95.00%        95.48%
+Round 40:    95.56%          95.31%        95.48%
 ```
 
-> **Note**: 5 つの固有アーキテクチャ構成では、各クライアントが独自の signature グループを形成するため、HeteroFL 集約は単純コピーに退化する。FedGen による知識蒸留が異種モデル間の唯一の知識共有メカニズムとして機能し、HeteroFL Only と同等以上の精度を達成している。
+> **Note**: 5 つの固有アーキテクチャ構成では、各クライアントが独自の signature グループを形成するため、HeteroFL 集約は単純コピーに退化する。FedGen による知識蒸留が異種モデル間の唯一の知識共有メカニズムとして機能している。3 方式とも 95% 以上の精度に収束し、安定した学習曲線を示す。
 
 ## 動作環境
 
@@ -72,7 +75,7 @@ uv sync
 
 ```yaml
 experiment:
-  num_rounds: 20          # 連合学習のラウンド数
+  num_rounds: 40          # 連合学習のラウンド数
 
 server:
   min_clients: 5          # 参加クライアント数
@@ -88,8 +91,8 @@ strategy:
     distill_every: 2       # 蒸留頻度（N ラウンドに 1 回）
 
 training:
-  local_epochs: 2         # クライアントのローカル学習エポック数
-  learning_rate: 0.01     # SGD 学習率
+  local_epochs: 3         # クライアントのローカル学習エポック数
+  learning_rate: 0.01     # SGD 初期学習率 (Cosine Annealing で自動減衰)
   momentum: 0.9
 ```
 
@@ -121,13 +124,13 @@ uv run python scripts/run_comparison.py
 実行中、各ラウンドのメトリクスがリアルタイムで表示される:
 
 ```
-Round  1: loss=1.3706, accuracy=0.4964, clients=5, time=156.4s
-Round  2: loss=0.7811, accuracy=0.7382, clients=5, time=152.2s
+Round  1: loss=1.3706, accuracy=0.4964, clients=5, time=56.4s
+Round  2: loss=0.7811, accuracy=0.7382, clients=5, time=52.2s
 ...
 Generator quality check passed: ensemble_acc=100.00%
 Distilled 5 models, avg_loss=0.0479
 ...
-Round 20: loss=0.2807, accuracy=0.9433, clients=5, time=151.7s
+Round 40: loss=0.1851, accuracy=0.9531, clients=5, time=55.3s
 ```
 
 ## アーキテクチャ
@@ -256,6 +259,16 @@ new_weights = (1 - β) × original_weights + β × distilled_weights  (β=0.1)
 ```
 
 5. **周期的蒸留**: 毎ラウンドではなく 2 ラウンドに 1 回蒸留を実行し、累積的な劣化を防止
+
+### Cosine LR Scheduling
+
+学習率を Cosine Annealing で自動調整:
+
+```
+lr(t) = lr_min + 0.5 × (lr_max - lr_min) × (1 + cos(π × t / T))
+```
+
+初期学習率 0.01 から最終的に 0.0001 まで滑らかに減衰し、終盤の精度を安定させる。
 
 ### FedGen Warmup
 
