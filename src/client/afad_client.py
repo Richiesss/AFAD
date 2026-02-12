@@ -137,12 +137,21 @@ class AFADClient(fl.client.NumPyClient):
         if "local_epochs" in config:
             self.epochs = config["local_epochs"]
 
+        fedprox_mu = config.get("fedprox_mu", 0.0)
+
         # Set model parameters if provided
         use_local_init = config.get("use_local_init", False)
         if parameters and len(parameters) > 0 and not use_local_init:
             self.set_parameters(parameters, config)
 
-        self._train()
+        # Snapshot global params for FedProx proximal term
+        global_params = (
+            [p.clone().detach() for p in self.model.parameters()]
+            if fedprox_mu > 0
+            else None
+        )
+
+        self._train(fedprox_mu=fedprox_mu, global_params=global_params)
 
         # Serialize label_counts as comma-separated string for Flower Scalar
         label_counts_str = ",".join(str(c) for c in self.label_counts)
@@ -159,8 +168,20 @@ class AFADClient(fl.client.NumPyClient):
             },
         )
 
-    def _train(self) -> None:
-        """Local training loop with SGD and gradient clipping."""
+    def _train(
+        self,
+        fedprox_mu: float = 0.0,
+        global_params: list[torch.Tensor] | None = None,
+    ) -> None:
+        """Local training loop with SGD, gradient clipping, and optional FedProx.
+
+        FedProx adds a proximal term (μ/2)||w - w_global||² to the loss,
+        penalizing drift from the global model. This stabilizes training
+        under Non-IID data distributions.
+
+        Reference: Li et al., "Federated Optimization in Heterogeneous
+        Networks" (MLSys 2020)
+        """
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.SGD(
             self.model.parameters(),
@@ -176,6 +197,16 @@ class AFADClient(fl.client.NumPyClient):
                 optimizer.zero_grad()
                 outputs = self.model(images)
                 loss = criterion(outputs, labels)
+
+                # FedProx proximal term: (μ/2) * ||w - w_global||²
+                if fedprox_mu > 0 and global_params is not None:
+                    prox_term = torch.tensor(0.0, device=self.device)
+                    for local_p, global_p in zip(
+                        self.model.parameters(), global_params
+                    ):
+                        prox_term += (local_p - global_p.to(self.device)).pow(2).sum()
+                    loss = loss + (fedprox_mu / 2.0) * prox_term
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
                 optimizer.step()

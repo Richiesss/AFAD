@@ -161,7 +161,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 new_config["family"] = family
 
             # Propagate training config with cosine LR scheduling
-            for key in ("momentum", "weight_decay", "local_epochs"):
+            for key in ("momentum", "weight_decay", "local_epochs", "fedprox_mu"):
                 if key in self.training_config:
                     new_config[key] = self.training_config[key]
 

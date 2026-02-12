@@ -156,6 +156,7 @@ def run_single_experiment(
     ds_mean: float,
     ds_std: float,
     seed: int = 42,
+    fedprox_mu: float = 0.0,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     logger.info(f"{'=' * 60}")
@@ -202,6 +203,7 @@ def run_single_experiment(
         "momentum": 0.9,
         "weight_decay": 0.0001,
         "local_epochs": local_epochs,
+        "fedprox_mu": fedprox_mu,
     }
 
     strategy = AFADStrategy(
@@ -353,6 +355,7 @@ def main():
     local_epochs = config_dict.get("training", {}).get("local_epochs", 3)
     batch_size = config_dict["data"].get("batch_size", 64)
     seed = config_dict["experiment"].get("seed", 42)
+    fedprox_mu = config_dict.get("training", {}).get("fedprox_mu", 0.0)
 
     # Client mappings
     cid_to_model, cid_to_family = get_client_mappings(num_clients)
@@ -390,6 +393,7 @@ def main():
         "ds_mean": ds_cfg.mean[0],
         "ds_std": ds_cfg.std[0],
         "seed": seed,
+        "fedprox_mu": fedprox_mu,
     }
 
     results: dict[str, list[dict]] = {}

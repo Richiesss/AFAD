@@ -71,6 +71,7 @@ training:
   optimizer: "sgd"
   momentum: 0.9
   weight_decay: 0.0001
+  fedprox_mu: 0.01        # FedProx proximal term coefficient (0 = disabled)
 
 evaluation:
   metrics: ["accuracy", "f1_score", "communication_cost"]
