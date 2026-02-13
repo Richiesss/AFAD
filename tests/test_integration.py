@@ -40,7 +40,11 @@ class _MockClientProxy(ClientProxy):
         return None
 
 
-def _build_strategy(enable_fedgen: bool = True, num_classes: int = 10) -> AFADStrategy:
+def _build_strategy(
+    enable_fedgen: bool = True,
+    enable_heterofl: bool = True,
+    num_classes: int = 10,
+) -> AFADStrategy:
     """Create an AFADStrategy with model factories for ResNet18 and ViT-Tiny."""
     generator = SyntheticGenerator(noise_dim=32, num_classes=num_classes, hidden_dim=64)
     router = FamilyRouter()
@@ -62,6 +66,7 @@ def _build_strategy(enable_fedgen: bool = True, num_classes: int = 10) -> AFADSt
         family_router=router,
         model_factories=model_factories,
         enable_fedgen=enable_fedgen,
+        enable_heterofl=enable_heterofl,
         num_classes=num_classes,
         fedgen_config={
             "gen_lr": 1e-3,
@@ -254,6 +259,68 @@ class TestIntegration:
 
         strategy.aggregate_fit(1, results, failures=[])
         assert not strategy._generator_trained
+
+    def test_fedgen_only_mode_no_aggregation(self):
+        """enable_heterofl=False: per-client models, no intra-group averaging."""
+        strategy = _build_strategy(enable_heterofl=False, enable_fedgen=True)
+        train_loaders, _test_loader = load_mnist_data(
+            num_clients=2, batch_size=8, max_samples=200
+        )
+
+        client_cnn = AFADClient(
+            cid="0",
+            model=ModelRegistry.create_model("resnet18"),
+            train_loader=train_loaders[0],
+            epochs=1,
+            device="cpu",
+            family="cnn",
+            model_name="resnet18",
+        )
+        client_vit = AFADClient(
+            cid="1",
+            model=ModelRegistry.create_model("vit_tiny"),
+            train_loader=train_loaders[1],
+            epochs=1,
+            device="cpu",
+            family="vit",
+            model_name="vit_tiny",
+        )
+        clients = {"0": client_cnn, "1": client_vit}
+
+        for round_num in range(1, 3):
+            results = []
+            for cid, client in clients.items():
+                config = {"use_local_init": (round_num == 1), "round": round_num}
+                updated_params, num_examples, metrics = client.fit([], config)
+                proxy = _MockClientProxy(cid)
+                fit_res = FitRes(
+                    status=Status(code=Code.OK, message="ok"),
+                    parameters=ndarrays_to_parameters(updated_params),
+                    num_examples=num_examples,
+                    metrics=metrics,
+                )
+                results.append((proxy, fit_res))
+
+            agg_params, agg_metrics = strategy.aggregate_fit(
+                round_num, results, failures=[]
+            )
+            assert agg_params is not None
+            assert agg_metrics["total_clients"] == 2
+
+        # Per-client models should be stored
+        assert len(strategy.client_models) == 2
+        assert "0" in strategy.client_models
+        assert "1" in strategy.client_models
+
+        # Global models exist for initial delivery but are not aggregated
+        assert len(strategy.global_models) == 2
+
+        # Generator should have been trained (FedGen enabled)
+        assert strategy._generator_trained
+
+        # Client model names tracked
+        assert strategy.client_model_names.get("0") == "resnet18"
+        assert strategy.client_model_names.get("1") == "vit_tiny"
 
 
 class TestIntegration11Classes:

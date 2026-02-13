@@ -39,9 +39,9 @@ logger = setup_logger("MultiSeed")
 DEFAULT_SEEDS = [42, 123, 456, 789, 1024, 2025, 3141, 4096, 5555, 7777]
 
 METHODS = [
-    {"label": "HeteroFL Only", "enable_fedgen": False},
-    {"label": "FedGen Only", "enable_fedgen": True},
-    {"label": "AFAD Hybrid", "enable_fedgen": True},
+    {"label": "HeteroFL Only", "enable_fedgen": False, "enable_heterofl": True},
+    {"label": "FedGen Only", "enable_fedgen": True, "enable_heterofl": False},
+    {"label": "AFAD Hybrid", "enable_fedgen": True, "enable_heterofl": True},
 ]
 
 
@@ -137,6 +137,7 @@ def run_seed(
         rounds = run_single_experiment(
             label=f"{method['label']} (seed={seed})",
             enable_fedgen=method["enable_fedgen"],
+            enable_heterofl=method.get("enable_heterofl", True),
             **exp_kwargs,
         )
         seed_results[method["label"]] = rounds

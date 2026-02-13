@@ -57,6 +57,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         fedgen_config: dict[str, Any] | None = None,
         training_config: dict[str, Any] | None = None,
         enable_fedgen: bool = True,
+        enable_heterofl: bool = True,
         num_rounds: int = 20,
         num_classes: int = 10,
         **kwargs,
@@ -66,11 +67,16 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self.router = family_router
         self.model_factories = model_factories or {}
         self.enable_fedgen = enable_fedgen
+        self.enable_heterofl = enable_heterofl
         self.num_rounds = num_rounds
         self.num_classes = num_classes
 
         # Per-signature global models (stored as numpy arrays)
         self.global_models: dict[str, list[np.ndarray]] = {}
+
+        # Per-client models for FedGen-only mode (no HeteroFL aggregation)
+        self.client_models: dict[str, list[np.ndarray]] = {}
+        self.client_model_names: dict[str, str] = {}
 
         # Client model rates for HeteroFL
         self.client_model_rates: dict[str, float] = client_model_rates or {}
@@ -173,9 +179,11 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 1 + math.cos(math.pi * progress)
             )
 
-            # Send matching global model if available
+            # Send matching model: per-client (FedGen-only) or per-signature
             sig = self.client_model_signatures.get(cid)
-            if sig and sig in self.global_models:
+            if not self.enable_heterofl and cid in self.client_models:
+                model_ndarrays = self.client_models[cid]
+            elif sig and sig in self.global_models:
                 model_ndarrays = self.global_models[sig]
             else:
                 model_ndarrays = []
@@ -229,40 +237,58 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             sig = self._get_model_signature(params)
             self.client_model_signatures[cid] = sig
 
-            # Track sig -> model_name mapping
+            # Track sig -> model_name and per-client model_name mappings
             if model_name:
                 self.sig_to_model_name[sig] = model_name
+                self.client_model_names[cid] = model_name
 
             if sig not in signature_results:
                 signature_results[sig] = []
             signature_results[sig].append((cid, params, fit_res.num_examples, family))
 
-        # HeteroFL aggregation per signature group
-        for sig, items in signature_results.items():
-            if sig not in self.global_models:
-                first_params = items[0][1]
-                self.global_models[sig] = [p.copy() for p in first_params]
+        if self.enable_heterofl:
+            # HeteroFL aggregation per signature group
+            for sig, items in signature_results.items():
+                if sig not in self.global_models:
+                    first_params = items[0][1]
+                    self.global_models[sig] = [p.copy() for p in first_params]
 
-            current_global = self.global_models[sig]
-            aggregation_items = [
-                (cid, params, num_ex) for cid, params, num_ex, _ in items
-            ]
+                current_global = self.global_models[sig]
+                aggregation_items = [
+                    (cid, params, num_ex) for cid, params, num_ex, _ in items
+                ]
 
-            updated_params = self.hetero_aggregator.aggregate_simple(
-                family=sig,
-                results=[(params, num_ex) for _, params, num_ex in aggregation_items],
-                global_params=current_global,
-            )
-            self.global_models[sig] = parameters_to_ndarrays(updated_params)
+                updated_params = self.hetero_aggregator.aggregate_simple(
+                    family=sig,
+                    results=[
+                        (params, num_ex) for _, params, num_ex in aggregation_items
+                    ],
+                    global_params=current_global,
+                )
+                self.global_models[sig] = parameters_to_ndarrays(updated_params)
 
-            families = set(family for _, _, _, family in items)
-            logger.info(
-                f"Signature {sig[:50]}...: aggregated {len(items)} clients "
-                f"from families {families}"
-            )
+                families = set(family for _, _, _, family in items)
+                logger.info(
+                    f"Signature {sig[:50]}...: aggregated {len(items)} clients "
+                    f"from families {families}"
+                )
+        else:
+            # FedGen-only: store per-client models, no intra-group averaging
+            for sig, items in signature_results.items():
+                for cid, params, _num_ex, _family in items:
+                    self.client_models[cid] = [p.copy() for p in params]
+                # Keep global_models for initial delivery only
+                if sig not in self.global_models:
+                    self.global_models[sig] = [p.copy() for p in items[0][1]]
+            logger.info(f"FedGen-only mode: stored {len(results)} per-client models")
 
         # FedGen: Train generator + distill models after aggregation
-        if self.enable_fedgen and len(self.global_models) >= 2:
+        num_available = (
+            len(self.client_models)
+            if not self.enable_heterofl
+            else len(self.global_models)
+        )
+        if self.enable_fedgen and num_available >= 2:
             self._train_generator_on_server(server_round)
 
         # Metrics
@@ -291,34 +317,82 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         # Reconstruct nn.Module from stored numpy arrays
         torch_models: dict[str, nn.Module] = {}
 
-        for sig, np_params in self.global_models.items():
-            model_name = self.sig_to_model_name.get(sig)
-            if model_name and model_name in self.model_factories:
-                model = self.model_factories[model_name](num_classes=self.num_classes)
-                state_dict = model.state_dict()
-                keys = list(state_dict.keys())
-                if len(keys) == len(np_params):
-                    for key, arr in zip(keys, np_params):
-                        state_dict[key] = torch.from_numpy(arr.copy())
-                    model.load_state_dict(state_dict)
-                    model.to(self.fedgen_distiller.device)
-                    torch_models[sig] = model
-                else:
-                    logger.warning(
-                        f"Param count mismatch for sig={sig[:30]}...: "
-                        f"model has {len(keys)}, stored {len(np_params)}"
+        if not self.enable_heterofl and self.client_models:
+            # FedGen-only: per-client models
+            for cid, np_params in self.client_models.items():
+                model_name = self.client_model_names.get(cid)
+                if model_name and model_name in self.model_factories:
+                    model = self.model_factories[model_name](
+                        num_classes=self.num_classes
                     )
-            else:
-                logger.debug(
-                    f"No factory for sig={sig[:30]}... (model_name={model_name})"
-                )
+                    state_dict = model.state_dict()
+                    keys = list(state_dict.keys())
+                    if len(keys) == len(np_params):
+                        for key, arr in zip(keys, np_params):
+                            state_dict[key] = torch.from_numpy(arr.copy())
+                        model.load_state_dict(state_dict)
+                        model.to(self.fedgen_distiller.device)
+                        torch_models[cid] = model
+                    else:
+                        logger.warning(
+                            f"Param count mismatch for cid={cid}: "
+                            f"model has {len(keys)}, stored {len(np_params)}"
+                        )
+                else:
+                    logger.debug(f"No factory for cid={cid} (model_name={model_name})")
+        else:
+            # HeteroFL / AFAD: per-signature models
+            for sig, np_params in self.global_models.items():
+                model_name = self.sig_to_model_name.get(sig)
+                if model_name and model_name in self.model_factories:
+                    model = self.model_factories[model_name](
+                        num_classes=self.num_classes
+                    )
+                    state_dict = model.state_dict()
+                    keys = list(state_dict.keys())
+                    if len(keys) == len(np_params):
+                        for key, arr in zip(keys, np_params):
+                            state_dict[key] = torch.from_numpy(arr.copy())
+                        model.load_state_dict(state_dict)
+                        model.to(self.fedgen_distiller.device)
+                        torch_models[sig] = model
+                    else:
+                        logger.warning(
+                            f"Param count mismatch for sig={sig[:30]}...: "
+                            f"model has {len(keys)}, stored {len(np_params)}"
+                        )
+                else:
+                    logger.debug(
+                        f"No factory for sig={sig[:30]}... (model_name={model_name})"
+                    )
 
         if len(torch_models) < 2:
             logger.info("Not enough reconstructable models for generator training")
             return
 
-        # Compute label weights from client label counts
-        label_counts_list = list(self.client_label_counts.values())
+        # Compute label weights
+        if not self.enable_heterofl and self.client_models:
+            # FedGen-only: per-client counts (naturally aligned with per-client models)
+            label_counts_list = [
+                self.client_label_counts[cid]
+                for cid in torch_models
+                if cid in self.client_label_counts
+            ]
+        else:
+            # HeteroFL / AFAD: aggregate per-client counts to per-signature
+            sig_label_counts: dict[str, list[int]] = {}
+            for cid, counts in self.client_label_counts.items():
+                sig = self.client_model_signatures.get(cid)
+                if sig and sig in torch_models:
+                    if sig not in sig_label_counts:
+                        sig_label_counts[sig] = [0] * self.num_classes
+                    for i, c in enumerate(counts):
+                        if i < self.num_classes:
+                            sig_label_counts[sig][i] += c
+            label_counts_list = [
+                sig_label_counts[sig] for sig in torch_models if sig in sig_label_counts
+            ]
+
         if not label_counts_list:
             # Fallback: uniform weights
             num_models = len(torch_models)
@@ -354,13 +428,22 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 qualified_labels=qualified_labels,
             )
 
-            # Write distilled model params back to global_models
+            # Write distilled model params back
             if distill_losses:
-                for sig, model in torch_models.items():
-                    self.global_models[sig] = [
-                        val.cpu().detach().numpy()
-                        for val in model.state_dict().values()
-                    ]
+                if not self.enable_heterofl:
+                    # FedGen-only: write back to per-client models
+                    for cid, model in torch_models.items():
+                        self.client_models[cid] = [
+                            val.cpu().detach().numpy()
+                            for val in model.state_dict().values()
+                        ]
+                else:
+                    # HeteroFL / AFAD: write back to global_models
+                    for sig, model in torch_models.items():
+                        self.global_models[sig] = [
+                            val.cpu().detach().numpy()
+                            for val in model.state_dict().values()
+                        ]
                 logger.info(
                     f"Distilled {len(distill_losses)} models, "
                     f"avg_loss={sum(distill_losses.values()) / len(distill_losses):.4f}"
@@ -386,7 +469,9 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             config["round"] = server_round
 
             sig = self.client_model_signatures.get(cid)
-            if sig and sig in self.global_models:
+            if not self.enable_heterofl and cid in self.client_models:
+                client_params = ndarrays_to_parameters(self.client_models[cid])
+            elif sig and sig in self.global_models:
                 client_params = ndarrays_to_parameters(self.global_models[sig])
             else:
                 client_params = eval_ins.parameters

@@ -158,11 +158,15 @@ def run_single_experiment(
     ds_std: float,
     seed: int = 42,
     fedprox_mu: float = 0.0,
+    enable_heterofl: bool = True,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     logger.info(f"{'=' * 60}")
     logger.info(f"Starting experiment: {label}")
-    logger.info(f"  enable_fedgen={enable_fedgen}, clients={num_clients}")
+    logger.info(
+        f"  enable_fedgen={enable_fedgen}, enable_heterofl={enable_heterofl}, "
+        f"clients={num_clients}"
+    )
     logger.info(f"{'=' * 60}")
 
     torch.manual_seed(seed)
@@ -216,6 +220,7 @@ def run_single_experiment(
         fedgen_config=fedgen_config,
         training_config=training_config,
         enable_fedgen=enable_fedgen,
+        enable_heterofl=enable_heterofl,
         num_rounds=num_rounds,
         num_classes=num_classes,
         min_fit_clients=num_clients,
@@ -404,13 +409,15 @@ def main():
     results["HeteroFL Only"] = run_single_experiment(
         label="HeteroFL Only",
         enable_fedgen=False,
+        enable_heterofl=True,
         **exp_kwargs,
     )
 
-    # --- Experiment 2: FedGen Only ---
+    # --- Experiment 2: FedGen Only (no HeteroFL aggregation) ---
     results["FedGen Only"] = run_single_experiment(
         label="FedGen Only",
         enable_fedgen=True,
+        enable_heterofl=False,
         **exp_kwargs,
     )
 
@@ -418,6 +425,7 @@ def main():
     results["AFAD Hybrid"] = run_single_experiment(
         label="AFAD Hybrid",
         enable_fedgen=True,
+        enable_heterofl=True,
         **exp_kwargs,
     )
 
