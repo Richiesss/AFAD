@@ -1,23 +1,171 @@
 # AFAD (Adaptive Federated Architecture Distribution)
 
-異種モデルが混在する連合学習（Federated Learning）環境で、効率的に知識を共有するハイブリッドフレームワーク。
-HeteroFL（同族間の部分重み共有）と FedGen（異種間の Data-Free Knowledge Distillation）を組み合わせ、計算資源が異なるデバイス間でも高精度な協調学習を実現する。
+## 概要
 
-## 主な特徴
+連合学習 (Federated Learning; FL) では、参加デバイスの計算資源が不均一であることが一般的であり、
+全デバイスに同一モデルを配布する従来の FedAvg では非効率が生じる。
+この問題に対して、**異種アーキテクチャ間の効率的な知識共有**を可能にするハイブリッドフレームワーク **AFAD** を提案する。
 
-- **ハイブリッド集約戦略**
-  - **同族間 (Intra-Family)**: HeteroFL による部分的重み共有（例: ResNet50 ↔ ResNet18）
-  - **異種間 (Inter-Family)**: FedGen による Generator ベースの Data-Free KD（例: CNN ↔ ViT）
-- **サーバーサイド知識蒸留**
-  - EMA ブレンディング（β=0.1）で実データ訓練の重みを保護しつつ知識を転写
-  - 品質ゲートにより低品質な合成データでの蒸留を自動スキップ
-- **学習率スケジューリング**
-  - Cosine Annealing で学習率を自動減衰（lr_max → lr_max×0.01）
-- **5 種類の異種モデルをサポート**
-  - CNN Family: ResNet50, ResNet18, MobileNetV3-Large
-  - ViT Family: ViT-Tiny, DeiT-Small
-- **Flower Simulation** による単一マシン上の FL シミュレーション（Ray バックエンド）
-- **GPU / CPU 両対応** — CUDA 検出時は自動で GPU を使用
+AFAD は 2 つの既存手法を統合し、それぞれの適用範囲を使い分ける:
+
+- **同族間 (Intra-Family)**: HeteroFL [Diao+, ICLR 2021] による部分重み共有
+  （例: ResNet50 ↔ ResNet18 — パラメータ空間が重なる同系列モデル間で直接重みを集約）
+- **異種間 (Inter-Family)**: FedGen [Zhu+, ICML 2021] による Data-Free Knowledge Distillation
+  （例: CNN ↔ ViT — パラメータ空間が完全に異なるモデル間で合成データを介して知識を転写）
+
+さらに、蒸留プロセスの安定化のために **サーバーサイド蒸留**、**品質ゲート**、**EMA ブレンディング**、**FedProx 正則化** 等の安定化機構を導入し、Non-IID 環境でもロバストな学習を実現する。
+
+---
+
+## 提案手法の詳細
+
+### 1. 問題設定
+
+$K$ 台のクライアントがそれぞれ異なるモデルアーキテクチャ $f_{k}$ と局所データ $\mathcal{D}_{k}$ を持つ連合学習環境を考える。各データは Non-IID に分布しており（Dirichlet 分割、$\alpha = 0.5$）、クライアント間でラベル分布が大きく偏る。
+
+本フレームワークでは以下の 5 種類のモデルを使用する:
+
+| Family | モデル | パラメータ数 | 特徴 |
+|--------|--------|:---:|------|
+| CNN | ResNet50 | ~23.5M | 深い残差ネットワーク |
+| CNN | ResNet18 | ~11.2M | 軽量残差ネットワーク |
+| CNN | MobileNetV3-Large | ~4.2M | 逆残差ブロック、モバイル向け |
+| ViT | ViT-Tiny | ~5.5M | 自己注意機構によるパッチ処理 |
+| ViT | DeiT-Small | ~21.7M | 蒸留トークン付き ViT |
+
+CNN 系と ViT 系はパラメータ空間が根本的に異なる（畳み込みカーネル vs 自己注意重み行列）ため、従来の重み平均では知識共有ができない。これが AFAD のハイブリッドアプローチを必要とする根本的な動機である。
+
+### 2. ラウンドごとの処理フロー
+
+各連合学習ラウンド $t$ は以下の 4 ステップで構成される:
+
+```
+Round t:
+  [Step 1] Server → Clients : モデルパラメータ配信
+  [Step 2] Clients          : ローカル学習 (SGD + FedProx)
+  [Step 3] Clients → Server : 更新済みパラメータ送信
+  [Step 4] Server           : 集約 (HeteroFL) → Generator 学習 → 知識蒸留 (FedGen)
+```
+
+### 3. Step 1–3: ローカル学習と FedProx 正則化
+
+各クライアント $k$ は、受信したグローバルモデルパラメータ $w^{t}$ を初期値として、局所データ $\mathcal{D}_{k}$ 上で SGD による学習を行う。Non-IID 環境でのクライアントドリフト（各クライアントの更新が全体最適から乖離する現象）を抑制するため、FedProx [Li+, MLSys 2020] の近接項を損失関数に追加する:
+
+$$\mathcal{L}_{k} = \mathcal{L}_{CE}(f_{k}(x), y) + \frac{\mu}{2} \| w_{k} - w^{t} \|^2$$
+
+ここで $\mu = 0.01$ は近接項の強度を制御するハイパーパラメータである。第 2 項がグローバルモデルからの過度な乖離を抑制し、Non-IID 環境での学習を安定化させる。
+
+学習率はサーバーが Cosine Annealing でラウンドごとに管理し、全クライアントに配信する:
+
+$$\text{lr}(t) = \text{lr}_{min} + \frac{1}{2}(\text{lr}_{max} - \text{lr}_{min})\left(1 + \cos\left(\frac{\pi \cdot t}{T}\right)\right)$$
+
+ここで $\text{lr}_{max} = 0.01$, $\text{lr}_{min} = 0.0001$, $T$ は総ラウンド数である。
+
+### 4. Step 4a: HeteroFL による同族間集約
+
+クライアントから返送されたモデルパラメータを、**パラメータ形状の一致するグループ（signature group）** ごとに分類し、グループ内でカウントベースの重み平均を行う。
+
+HeteroFL の核心的アイデアは、異なるサイズのモデルであっても **パラメータ空間の先頭部分を共有** できる点にある。例えば ResNet50 の各層の先頭 $r$ 割（$r$ = model_rate）が ResNet18 のパラメータに対応する。集約時には各パラメータ位置について更新されたクライアント数で割る（サンプル数による重み付けではなく均等平均）:
+
+$$w^{t+1}[i,j] = \frac{1}{|S_{i,j}|} \sum_{k \in S_{i,j}} w_{k}^{t}[i,j]$$
+
+ここで $S_{i,j}$ はパラメータ位置 $(i,j)$ を更新したクライアントの集合である。更新されなかった位置はグローバルモデルの値をそのまま保持する。
+
+出力層（分類層）は幅スケーリングの対象外とし、全クライアントが全クラスの分類器を保持する。
+
+### 5. Step 4b: FedGen によるサーバーサイド知識蒸留
+
+HeteroFL は同族間（同じ系列のモデル）でのみ有効であり、CNN と ViT の間では重みの直接共有ができない。この異種間の知識転写を **合成データを介した Data-Free Knowledge Distillation** で実現する。
+
+原論文の FedGen はクライアント側で蒸留を行うが、合成データの品質が低い段階ではクライアントの学習を不安定化させるリスクがある。AFAD ではこの蒸留を **サーバーサイドで実行** し、複数の安定化機構を導入した。
+
+#### 5.1 条件付き Generator の学習
+
+サーバー上の Generator $G$ はクラスラベル $y$ とノイズ $\epsilon$ を入力とし、合成画像 $\hat{x} = G(y, \epsilon)$ を生成する。Generator は全クライアントモデルのアンサンブルが合成画像に対して正しいクラスを一致して予測するよう最適化される:
+
+$$\mathcal{L}_{G} = \alpha \cdot \mathcal{L}_{teacher} + \eta \cdot \mathcal{L}_{diversity}$$
+
+**教師損失** $\mathcal{L}_{teacher}$ は、各モデル $f_m$ がラベル $y$ を正しく予測するよう重み付き交差エントロピーを計算する。重みはクライアントの各ラベルのサンプル数に基づき、Non-IID 環境でのラベル偏りを補正する:
+
+$$\mathcal{L}_{teacher} = \sum_{m=1}^{M} \sum_{i=1}^{B} w_{y_i, m} \cdot \text{CE}(f_m(\hat{x}_i), y_i)$$
+
+**多様性損失** $\mathcal{L}_{diversity}$ は Generator のモード崩壊を防止する。異なるノイズ入力から異なる出力を生成するよう促す:
+
+$$\mathcal{L}_{diversity} = \exp\left(-\text{mean}(d(\hat{x}) \odot d(\epsilon))\right)$$
+
+ここで $d(\cdot)$ はペアワイズ L2 距離である。
+
+#### 5.2 品質ゲート
+
+Generator の学習初期は合成画像の品質が低い。低品質な合成データで蒸留を行うとモデル精度が劣化するため、**品質ゲート** を設けて蒸留の実行可否を判断する:
+
+> アンサンブルの合成画像に対する Top-1 精度が **40% 未満** の場合、そのラウンドの蒸留をスキップする。
+
+この閾値は Generator の成熟度を反映し、十分な品質に達してから蒸留を開始する。
+
+#### 5.3 知識蒸留 (Knowledge Distillation)
+
+品質ゲートを通過した後、各モデルを **生徒 (student)** として、残りの全モデルのアンサンブルを **教師 (teacher)** として知識蒸留を行う。Generator が生成した合成画像 $\hat{x}$ に対して:
+
+1. 教師アンサンブルの soft label を計算: $p_{teacher} = \frac{1}{|T|}\sum_{m \in T} \text{softmax}(f_m(\hat{x}) / \tau)$
+2. 生徒の出力との KL ダイバージェンスを最小化: $\mathcal{L}_{KD} = \text{KL}(\log\text{softmax}(f_{student}(\hat{x}) / \tau) \| p_{teacher})$
+
+温度パラメータ $\tau = 4.0$ により、soft label の確率分布を平滑化し、暗黙知（dark knowledge）の転写を促進する。
+
+#### 5.4 EMA ブレンディング
+
+蒸留は合成データ上で行われるため、実データで学習した表現を過度に書き換えるリスクがある。これを防ぐため、蒸留後の重みを元の重みと **指数移動平均 (EMA)** で混合する:
+
+$$w_{new} = (1 - \beta) \cdot w_{original} + \beta \cdot w_{distilled} \quad (\beta = 0.1)$$
+
+$\beta = 0.1$ は蒸留の影響を 10% に抑え、実データで獲得した特徴表現の 90% を保護する。
+
+#### 5.5 Warmup と周期的蒸留
+
+- **Warmup**: 最初の 3 ラウンドは蒸留を行わない。モデルがランダム初期化に近い段階では Generator の学習が不安定なため、十分な精度に達してから蒸留を開始する
+- **周期的実行**: 蒸留は warmup 後、2 ラウンドに 1 回の頻度で実行する。毎ラウンド蒸留すると合成データへの過適合による累積的な精度劣化が生じるため、実データ学習と蒸留を交互に行う
+
+### 6. システムアーキテクチャ
+
+```
+Server (AFADStrategy)
+│
+├─ configure_fit()
+│   └─ 各クライアントに対応する signature の
+│      グローバルモデルと Cosine LR を配信
+│
+├─ aggregate_fit()
+│   ├─ [1] Signature 分類
+│   │     クライアントのパラメータ形状から自動グループ化
+│   │     例: ResNet50×2 / ResNet18×2 / MNetV3×2 / ViT-Tiny×2 / DeiT-Small×2
+│   │
+│   ├─ [2] HeteroFL 集約 (グループごと)
+│   │     グループ内でカウントベース重み平均
+│   │     → 5 つのグローバルモデルを更新
+│   │
+│   └─ [3] FedGen (全モデル横断)
+│         ├─ Generator 学習: 全 5 モデルのアンサンブル一致を最大化
+│         ├─ 品質ゲート: ensemble_acc ≥ 40% を確認
+│         └─ 知識蒸留: 各モデルを生徒、残り 4 モデルを教師として KD
+│            最後に EMA ブレンディングで重みを混合
+│
+├─ configure_evaluate()
+│   └─ 各クライアントに対応するグローバルモデルを配信
+│
+└─ aggregate_evaluate()
+    └─ 加重平均で全体精度を集約
+
+Clients (AFADClient)
+├─ Client 0,1: ResNet50   (CNN)     ─┐
+├─ Client 2,3: MobileNetV3 (CNN)     ├─ CNN Family
+├─ Client 4,5: ResNet18   (CNN)     ─┘
+├─ Client 6,7: ViT-Tiny   (ViT)     ─┐
+└─ Client 8,9: DeiT-Small (ViT)     ─┘ ViT Family
+
+各クライアント:
+  SGD + FedProx (μ=0.01) + Gradient Clipping (max_norm=1.0)
+  ローカルエポック数: 3
+```
 
 ## Phase 1 実験結果
 
@@ -207,38 +355,6 @@ Distilled 5 models, avg_loss=0.0479
 Round 40: loss=0.1851, accuracy=0.9531, clients=5, time=55.3s
 ```
 
-## アーキテクチャ
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    Flower Server                          │
-│                                                           │
-│  AFADStrategy                                             │
-│  ├── configure_fit()    クライアントごとのモデル配信       │
-│  ├── aggregate_fit()    HeteroFL + FedGen 集約            │
-│  │   ├── HeteroFLAggregator   同族間: 重み平均            │
-│  │   └── FedGenDistiller      異種間: サーバーサイド KD   │
-│  │       ├── Phase 1: Generator 学習                      │
-│  │       │   L = α·L_teacher + η·L_diversity              │
-│  │       ├── Phase 2: 品質ゲート (ensemble_acc ≥ 40%)     │
-│  │       └── Phase 3: EMA 付き KD 蒸留                    │
-│  │           new = (1-β)·original + β·distilled           │
-│  ├── configure_evaluate()  各クライアントに自身のモデル送信│
-│  └── aggregate_evaluate()  加重平均で精度集約              │
-│                                                           │
-│  SyntheticGenerator (MNIST 正規化済み合成画像生成)         │
-│  MetricsCollector   (ラウンドごとの精度・損失・時間記録)   │
-└──────────────────────┬────────────────────────────────────┘
-                       │ Flower Protocol
-    ┌──────────────────┼──────────────────┐
-    │                  │                  │
-┌───┴───┐  ┌──────┐  ┌┴──────┐  ┌──────┐  ┌───────┐
-│Client0│  │Client1│  │Client2│  │Client3│  │Client4│
-│ResNet50│ │MNetV3 │  │ResNet18│ │ViT-T │  │DeiT-S │
-│  CNN  │  │  CNN  │  │  CNN  │  │  ViT │  │  ViT  │
-└───────┘  └──────┘  └───────┘  └──────┘  └───────┘
-```
-
 ## ディレクトリ構造
 
 ```
@@ -317,48 +433,11 @@ uv run ruff check --fix . && uv run ruff format .
 uv run poe all    # lint + test
 ```
 
-## 技術的な補足
-
-### サーバーサイド知識蒸留
-
-AFAD は FedGen (Zhu et al., ICML 2021) をサーバーサイドに適応している。
-クライアント側での蒸留は合成データの品質問題により精度が不安定になるため、蒸留をサーバー側で行い、以下の安定化機構を導入した:
-
-1. **Generator Training**: 合成画像をモデルアンサンブルに入力し、一貫した予測を生成するよう Generator を学習
-2. **品質ゲート**: アンサンブルが合成画像を 40% 以上正しく分類できない場合、蒸留をスキップ
-3. **Knowledge Distillation**: アンサンブルの soft logits を教師として、KL ダイバージェンスで各モデルに知識を転写
-
-```
-KD_loss = KL(softmax(student/T) ‖ softmax(teacher/T))
-```
-
-4. **EMA ブレンディング**: 蒸留後の重みを元の重みと混合し、実データ訓練の成果を保護
-
-```
-new_weights = (1 - β) × original_weights + β × distilled_weights  (β=0.1)
-```
-
-5. **周期的蒸留**: 毎ラウンドではなく 2 ラウンドに 1 回蒸留を実行し、累積的な劣化を防止
-
-### Cosine LR Scheduling
-
-学習率を Cosine Annealing で自動調整:
-
-```
-lr(t) = lr_min + 0.5 × (lr_max - lr_min) × (1 + cos(π × t / T))
-```
-
-初期学習率 0.01 から最終的に 0.0001 まで滑らかに減衰し、終盤の精度を安定させる。
-
-### FedGen Warmup
-
-FedGen 蒸留は Round 4 から開始（3 ラウンドの warmup）。
-初期ラウンドでローカル学習を十分に行い、モデルが意味のある特徴を獲得してから蒸留を開始することで、学習の不安定化を防ぐ。
-
-### 参考文献
+## 参考文献
 
 - Diao, E. et al. "HeteroFL: Computation and Communication Efficient Federated Learning for Heterogeneous Clients" (ICLR 2021)
 - Zhu, Z. et al. "Data-Free Knowledge Distillation for Heterogeneous Federated Learning" (ICML 2021)
+- Li, T. et al. "Federated Optimization in Heterogeneous Networks" (MLSys 2020)
 
 ## 開発者
 
