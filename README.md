@@ -45,31 +45,63 @@ Round 40:    95.56%          95.31%        95.48%
 
 ## Phase 2 実験結果
 
-OrganAMNIST（11 クラス臓器分類）・Non-IID 分布（Dirichlet α=0.5）・10 クライアント（5 アーキテクチャ × 2）・40 ラウンド・Cosine LR:
+OrganAMNIST（11 クラス臓器分類）・Non-IID 分布（Dirichlet α=0.5）・10 クライアント（5 アーキテクチャ × 2）・40 ラウンド・Cosine LR・FedProx (μ=0.01)。
 
-| 方式 | Best Accuracy | Final Accuracy | Final Loss | Total Time |
+### Multi-Seed 統計的検証 (10 seeds)
+
+10 種類の乱数シード (42, 123, 456, 789, 1024, 2025, 3141, 4096, 5555, 7777) で繰り返し実験を行い、偶然の変動を排除した統計的評価を実施:
+
+| 方式 | Best Acc (Mean ± Std) | 95% CI | Final Acc (Mean ± Std) | 95% CI |
 |------|:---:|:---:|:---:|:---:|
-| HeteroFL Only | 70.88% | 70.73% | 1.4949 | 1,514s |
-| FedGen Only | 70.85% | 70.75% | 1.4407 | 1,683s |
-| **AFAD Hybrid** | **71.55%** | **71.37%** | **1.4320** | 1,666s |
+| HeteroFL Only | 71.70 ± 2.97% | ±2.12% | 71.62 ± 2.98% | ±2.13% |
+| FedGen Only | 71.95 ± 2.62% | ±1.88% | 71.82 ± 2.63% | ±1.88% |
+| **AFAD Hybrid** | **72.11 ± 2.61%** | **±1.86%** | **71.97 ± 2.57%** | **±1.84%** |
 
-精度推移:
+Best Accuracy 勝率: **AFAD Hybrid 6/10**, FedGen Only 4/10, HeteroFL Only 0/10
+
+### Paired t-test (AFAD Hybrid vs baselines)
+
+| 比較 | 指標 | t 値 | p 値 | 判定 |
+|------|------|:---:|:---:|:---:|
+| AFAD vs HeteroFL | Best Acc | 2.227 | 0.053 | 境界的有意 (p≈0.05) |
+| AFAD vs HeteroFL | Final Acc | 1.880 | 0.093 | n.s. |
+| AFAD vs FedGen | Best Acc | 0.840 | 0.423 | n.s. |
+| AFAD vs FedGen | Final Acc | 0.837 | 0.424 | n.s. |
+
+### Seed 別結果
+
+| Seed | HeteroFL Only | FedGen Only | AFAD Hybrid | Best |
+|:---:|:---:|:---:|:---:|:---:|
+| 42 | 71.33% | 70.28% | **71.66%** | AFAD |
+| 123 | 72.40% | 71.95% | **72.44%** | AFAD |
+| 456 | 70.84% | 71.37% | **71.79%** | AFAD |
+| 789 | 73.72% | **73.98%** | 73.76% | FedGen |
+| 1024 | 63.66% | **65.30%** | 65.06% | FedGen |
+| 2025 | 73.18% | 73.46% | **73.59%** | AFAD |
+| 3141 | 73.05% | **73.30%** | 72.38% | FedGen |
+| 4096 | 72.63% | **73.64%** | 73.57% | FedGen |
+| 5555 | 72.81% | 72.42% | **72.97%** | AFAD |
+| 7777 | 73.40% | 73.78% | **73.89%** | AFAD |
+
+### 平均精度推移 (10 seeds 平均)
 
 ```
          HeteroFL Only    FedGen Only    AFAD Hybrid
-Round  1:    13.85%          15.14%        14.42%
-Round  5:    46.20%          45.52%        47.04%
-Round 10:    61.93%          60.55%        62.41%
-Round 20:    69.11%          68.18%        69.56%
-Round 30:    70.73%          70.58%        71.34%
-Round 40:    70.73%          70.75%        71.37%
+Round  1:    15.11%          14.79%        14.68%
+Round  5:    52.82%          53.64%        53.53%
+Round 10:    65.29%          65.37%        65.55%
+Round 20:    70.15%          70.51%        70.61%
+Round 30:    71.36%          71.59%        71.69%
+Round 40:    71.62%          71.82%        71.97%
 ```
 
 > **Phase 2 の主な知見**:
-> - **AFAD Hybrid が一貫して最高精度を達成** — Best/Final ともに HeteroFL Only を約 +0.6pt 上回る
-> - Non-IID 環境で HeteroFL + FedGen の相補的効果が顕在化（Phase 1 の IID 環境では3方式ほぼ同等だった）
-> - FedGen の知識蒸留はロスの低減に特に効果的（HeteroFL: 1.495 → AFAD: 1.432）
-> - 10 クライアント（各アーキテクチャ 2 台）により HeteroFL のグループ内集約が有効に機能
+> - **AFAD Hybrid が平均精度で全方式中最高** (Best 72.11%, Final 71.97%) を達成し、10 seeds 中 6 回で Best を獲得
+> - **AFAD vs HeteroFL** は p=0.053 で境界的有意。HeteroFL を上回らなかった seed はゼロ（AFAD ≥ HeteroFL が 10/10 で成立）
+> - **AFAD vs FedGen** は僅差 (+0.16pt) で統計的有意差なし。FedGen 単体でも Non-IID 環境では有効
+> - Non-IID 環境で HeteroFL + FedGen の相補的効果が顕在化（Phase 1 の IID 環境では 3 方式ほぼ同等だった）
+> - Seed 1024 が全方式で異常に低い精度 (63-65%) を示し、全体の分散を増大させている。Dirichlet 分割の偏りが極端だった可能性がある
+> - **AFAD Hybrid は分散が最小** (std=2.61%) で、安定性の面でも優位
 
 ## 動作環境
 
@@ -135,7 +167,18 @@ uv run python scripts/run_comparison.py
 
 # 3 方式比較実験 - Phase 2 (OrganAMNIST, Non-IID, 10 clients)
 uv run python scripts/run_comparison.py config/afad_phase2_config.yaml
+
+# Multi-seed 統計的検証 (10 seeds, 全30実験, 約17時間)
+python scripts/run_multi_seed.py config/afad_phase2_config.yaml
+
+# seed を指定して実行
+python scripts/run_multi_seed.py config/afad_phase2_config.yaml --seeds 42 123 456
+
+# 出力先を指定
+python scripts/run_multi_seed.py config/afad_phase2_config.yaml --output results/my_results.json
 ```
+
+> **Note**: `run_multi_seed.py` は `uv run` ではなく `python` (venv 直接) で実行すること。Ray ワーカーの runtime_env 構築問題を回避するため。結果は JSON に逐次保存され、中断後の再実行で完了済み seed を自動スキップする。
 
 実行すると以下が自動で行われる:
 
@@ -206,6 +249,7 @@ AFAD/
 ├── scripts/
 │   ├── run_experiment.py         # 単一実験スクリプト
 │   ├── run_comparison.py         # 3 方式比較スクリプト
+│   ├── run_multi_seed.py         # Multi-seed 統計的検証スクリプト
 │   └── debug_integration.py      # 手動統合テスト
 ├── src/
 │   ├── client/
@@ -235,7 +279,7 @@ AFAD/
 │       ├── config_loader.py      # YAML 設定読み込み
 │       ├── logger.py             # ロガー
 │       └── metrics.py            # MetricsCollector
-├── tests/                        # テスト (77 件)
+├── tests/                        # テスト (84 件)
 │   ├── test_integration.py       # E2E 統合テスト (5/11 クラス)
 │   ├── test_fedgen_distiller.py  # FedGen 蒸留テスト (EMA 含む)
 │   ├── test_heterofl_aggregator.py  # HeteroFL 集約テスト

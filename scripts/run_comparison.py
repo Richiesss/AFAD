@@ -13,6 +13,7 @@ import os
 import sys
 
 import flwr as fl
+import numpy as np
 import ray
 import torch
 
@@ -165,6 +166,7 @@ def run_single_experiment(
     logger.info(f"{'=' * 60}")
 
     torch.manual_seed(seed)
+    np.random.seed(seed)
 
     family_router = FamilyRouter()
     generator = SyntheticGenerator(
