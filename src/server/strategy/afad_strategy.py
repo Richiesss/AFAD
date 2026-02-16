@@ -76,9 +76,11 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
         # Per-family global models for faithful HeteroFL mode (rate=1.0 models)
         self.family_global_models: dict[str, list[np.ndarray]] = {}
-        self.family_model_names: dict[str, str] = kwargs.pop(
-            "family_model_names", {}
-        ) if "family_model_names" in kwargs else {}
+        self.family_model_names: dict[str, str] = (
+            kwargs.pop("family_model_names", {})
+            if "family_model_names" in kwargs
+            else {}
+        )
 
         # Per-client models for FedGen-only mode (no HeteroFL aggregation)
         self.client_models: dict[str, list[np.ndarray]] = {}
@@ -164,9 +166,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             model_name = self.family_model_names.get(family)
             if model_name and model_name in self.model_factories:
                 model = self.model_factories[model_name](num_classes=self.num_classes)
-                params = [
-                    val.cpu().numpy() for val in model.state_dict().values()
-                ]
+                params = [val.cpu().numpy() for val in model.state_dict().values()]
                 self.family_global_models[family] = params
                 logger.info(
                     f"Initialized family global model: {family} -> {model_name} "
@@ -437,8 +437,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                         )
                 else:
                     logger.debug(
-                        f"No factory for family={family} "
-                        f"(model_name={model_name})"
+                        f"No factory for family={family} (model_name={model_name})"
                     )
         elif not self.enable_heterofl and self.client_models:
             # FedGen-only: per-client models
@@ -506,9 +505,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                         if i < self.num_classes:
                             family_label_counts[family][i] += c
             label_counts_list = [
-                family_label_counts[f]
-                for f in torch_models
-                if f in family_label_counts
+                family_label_counts[f] for f in torch_models if f in family_label_counts
             ]
         elif not self.enable_heterofl and self.client_models:
             # FedGen-only: per-client counts (naturally aligned with per-client models)
@@ -576,9 +573,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                             val.cpu().detach().numpy()
                             for val in model.state_dict().values()
                         ]
-                        self.global_models[family] = (
-                            self.family_global_models[family]
-                        )
+                        self.global_models[family] = self.family_global_models[family]
                 elif not self.enable_heterofl:
                     # FedGen-only: write back to per-client models
                     for cid, model in torch_models.items():

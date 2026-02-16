@@ -108,9 +108,9 @@ Generator の学習初期は合成画像の品質が低い。低品質な合成�
 品質ゲートを通過した後、各モデルを **生徒 (student)** として、残りの全モデルのアンサンブルを **教師 (teacher)** として知識蒸留を行う。Generator が生成した合成画像 $\hat{x}$ に対して:
 
 1. 教師アンサンブルの soft label を計算: $p_{teacher} = \frac{1}{|T|}\sum_{m \in T} \text{softmax}(f_m(\hat{x}) / \tau)$
-2. 生徒の出力との KL ダイバージェンスを最小化: $\mathcal{L}_{KD} = \text{KL}(\log\text{softmax}(f_{student}(\hat{x}) / \tau) \| p_{teacher})$
+2. 生徒の出力との KL ダイバージェンスを最小化: $\mathcal{L}_{KD} = \tau^2 \cdot \text{KL}(\log\text{softmax}(f_{student}(\hat{x}) / \tau) \| p_{teacher})$
 
-温度パラメータ $\tau = 4.0$ により、soft label の確率分布を平滑化し、暗黙知（dark knowledge）の転写を促進する。
+温度パラメータ $\tau = 4.0$ により、soft label の確率分布を平滑化し、暗黙知（dark knowledge）の転写を促進する。$\tau^2$ スケーリング（Hinton et al., 2015）は、softmax の温度分割により 1/$\tau^2$ に縮小する勾配を補償し、CE 損失と同等のスケールを回復する。
 
 #### 5.4 EMA ブレンディング
 

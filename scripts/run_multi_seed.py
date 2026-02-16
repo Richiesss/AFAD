@@ -26,9 +26,6 @@ from scipy import stats
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from scripts.run_comparison import (
-    CID_TO_RATE_P3,
-    FAMILY_MODEL_NAMES_P3,
-    _detect_phase,
     get_client_mappings,
     print_comparison_table,
     run_single_experiment,
