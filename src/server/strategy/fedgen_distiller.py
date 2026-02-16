@@ -366,10 +366,9 @@ class FedGenDistiller:
                         student_logits / temperature, dim=1
                     )
 
-                    # KD loss: soft label distillation
-                    # No T² scaling — with low-quality generator images,
-                    # we want inherently gentle gradients (scaled by 1/T)
-                    kd_loss = F.kl_div(
+                    # KD loss with T² scaling (Hinton et al., 2015):
+                    # Compensates for 1/T² factor in softmax gradients
+                    kd_loss = temperature**2 * F.kl_div(
                         student_log_soft, soft_targets, reduction="batchmean"
                     )
 

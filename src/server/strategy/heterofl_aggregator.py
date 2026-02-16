@@ -128,6 +128,16 @@ class HeteroFLAggregator:
                 param_idx.append((output_idx, input_idx))
                 prev_output_idx = output_idx
 
+            elif len(shape) == 3:
+                # ViT 3D params: [batch, seq, hidden] or [1, 1, hidden]
+                # Only scale the last dim (hidden); batch and seq are preserved
+                idx_0 = np.arange(shape[0])
+                idx_1 = np.arange(shape[1])
+                hidden_size = int(np.ceil(shape[2] * scaler))
+                idx_2 = np.arange(hidden_size)
+                param_idx.append((idx_0, idx_1, idx_2))
+                prev_output_idx = idx_2
+
             elif len(shape) == 4:
                 output_size = int(np.ceil(shape[0] * scaler))
                 output_idx = np.arange(output_size)
@@ -178,6 +188,10 @@ class HeteroFLAggregator:
                     sub_params.append(param[:out_size, :in_size, :, :].copy())
                 else:
                     sub_params.append(param.copy())
+            elif len(idx) == 3:
+                # 3D params (ViT pos_embedding, class_token)
+                s0, s1, s2 = len(idx[0]), len(idx[1]), len(idx[2])
+                sub_params.append(param[:s0, :s1, :s2].copy())
             else:
                 sub_params.append(param.copy())
 
@@ -266,6 +280,11 @@ class HeteroFLAggregator:
                         slices = tuple(slice(0, len(ix)) for ix in idx)
                         accumulated[i][slices] += local_param
                         count[i][slices] += 1
+                elif len(idx) == 3:
+                    # 3D params (ViT pos_embedding, class_token)
+                    s0, s1, s2 = len(idx[0]), len(idx[1]), len(idx[2])
+                    accumulated[i][:s0, :s1, :s2] += local_param
+                    count[i][:s0, :s1, :s2] += 1
 
         new_params = []
         for acc, cnt, orig in zip(accumulated, count, global_params):

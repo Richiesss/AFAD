@@ -26,6 +26,9 @@ from scipy import stats
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from scripts.run_comparison import (
+    CID_TO_RATE_P3,
+    FAMILY_MODEL_NAMES_P3,
+    _detect_phase,
     get_client_mappings,
     print_comparison_table,
     run_single_experiment,
@@ -40,7 +43,7 @@ DEFAULT_SEEDS = [42, 123, 456, 789, 1024, 2025, 3141, 4096, 5555, 7777]
 
 METHODS = [
     {"label": "HeteroFL Only", "enable_fedgen": False, "enable_heterofl": True},
-    {"label": "FedGen Only", "enable_fedgen": True, "enable_heterofl": False},
+    {"label": "KD Only", "enable_fedgen": True, "enable_heterofl": False},
     {"label": "AFAD Hybrid", "enable_fedgen": True, "enable_heterofl": True},
 ]
 
@@ -199,7 +202,7 @@ def compute_statistics(all_results: dict) -> dict:
     afad_best = np.array(method_metrics["AFAD Hybrid"]["best_accuracy"])
     afad_final = np.array(method_metrics["AFAD Hybrid"]["final_accuracy"])
 
-    for baseline in ["HeteroFL Only", "FedGen Only"]:
+    for baseline in ["HeteroFL Only", "KD Only"]:
         base_best = np.array(method_metrics[baseline]["best_accuracy"])
         base_final = np.array(method_metrics[baseline]["final_accuracy"])
 

@@ -1,0 +1,104 @@
+experiment:
+  name: "AFAD_OrganAMNIST_Phase3_FaithfulHeteroFL"
+  seed: 42
+  num_rounds: 40
+
+server:
+  address: "0.0.0.0:8080"
+  min_clients: 10
+  min_fit_clients: 10
+
+strategy:
+  type: "AFAD"
+  intra_family: "heterofl_faithful"
+  inter_family: "fedgen"
+  generator:
+    noise_dim: 32
+    hidden_dim: 256
+  fedgen:
+    gen_lr: 0.0003
+    batch_size: 128
+    ensemble_alpha: 1.0
+    ensemble_eta: 1.0
+    gen_epochs: 2
+    teacher_iters: 25
+    temperature: 4.0
+    distill_lr: 0.0001
+    distill_epochs: 1
+    distill_steps: 5
+    distill_alpha: 1.0
+    distill_beta: 0.1
+    distill_every: 2
+
+# 10 clients: 2 families (CNN, ViT) x width-scaled sub-models
+# Each family: 2 x rate=1.0, 2 x rate=0.5, 1 x rate=0.25
+#
+# CNN family (heterofl_resnet18):
+#   CID 0,1 -> rate=1.0  (channels: 64-128-256-512,  ~11.2M params)
+#   CID 2,3 -> rate=0.5  (channels: 32-64-128-256,   ~2.8M params)
+#   CID 4   -> rate=0.25 (channels: 16-32-64-128,    ~0.7M params)
+#
+# ViT family (heterofl_vit_small):
+#   CID 5,6 -> rate=1.0  (hidden=384, ~21.3M params)
+#   CID 7,8 -> rate=0.5  (hidden=192, ~5.4M params)
+#   CID 9   -> rate=0.25 (hidden=96,  ~1.4M params)
+clients:
+  - id: "0"
+    model: "heterofl_resnet18"
+    family: "cnn"
+    model_rate: 1.0
+  - id: "1"
+    model: "heterofl_resnet18"
+    family: "cnn"
+    model_rate: 1.0
+  - id: "2"
+    model: "heterofl_resnet18"
+    family: "cnn"
+    model_rate: 0.5
+  - id: "3"
+    model: "heterofl_resnet18"
+    family: "cnn"
+    model_rate: 0.5
+  - id: "4"
+    model: "heterofl_resnet18"
+    family: "cnn"
+    model_rate: 0.25
+  - id: "5"
+    model: "heterofl_vit_small"
+    family: "vit"
+    model_rate: 1.0
+  - id: "6"
+    model: "heterofl_vit_small"
+    family: "vit"
+    model_rate: 1.0
+  - id: "7"
+    model: "heterofl_vit_small"
+    family: "vit"
+    model_rate: 0.5
+  - id: "8"
+    model: "heterofl_vit_small"
+    family: "vit"
+    model_rate: 0.5
+  - id: "9"
+    model: "heterofl_vit_small"
+    family: "vit"
+    model_rate: 0.25
+
+data:
+  dataset: "organamnist"
+  num_classes: 11
+  distribution: "non_iid"
+  dirichlet_alpha: 0.5
+  batch_size: 64
+
+training:
+  local_epochs: 3
+  learning_rate: 0.01
+  optimizer: "sgd"
+  momentum: 0.9
+  weight_decay: 0.0001
+  fedprox_mu: 0.01
+
+evaluation:
+  metrics: ["accuracy", "f1_score", "communication_cost"]
+  eval_every: 1

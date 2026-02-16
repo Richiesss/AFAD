@@ -74,6 +74,12 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         # Per-signature global models (stored as numpy arrays)
         self.global_models: dict[str, list[np.ndarray]] = {}
 
+        # Per-family global models for faithful HeteroFL mode (rate=1.0 models)
+        self.family_global_models: dict[str, list[np.ndarray]] = {}
+        self.family_model_names: dict[str, str] = kwargs.pop(
+            "family_model_names", {}
+        ) if "family_model_names" in kwargs else {}
+
         # Per-client models for FedGen-only mode (no HeteroFL aggregation)
         self.client_models: dict[str, list[np.ndarray]] = {}
         self.client_model_names: dict[str, str] = {}
@@ -133,6 +139,40 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         shapes = tuple(p.shape for p in params)
         return str(shapes)
 
+    def _is_heterofl_faithful(self) -> bool:
+        """Check if faithful HeteroFL mode is active (client_model_rates non-empty)."""
+        return bool(self.client_model_rates)
+
+    def _get_label_split(self, cid: str) -> list[int] | None:
+        """Get non-zero label indices for a client (for label-split aggregation)."""
+        counts = self.client_label_counts.get(cid)
+        if counts is None:
+            return None
+        return [i for i, c in enumerate(counts) if c > 0]
+
+    def _initialize_family_models(self) -> None:
+        """Create rate=1.0 global models for each family (called once on first round)."""
+        if self.family_global_models:
+            return  # Already initialized
+
+        families_seen: set[str] = set()
+        for cid, family in self.client_family_map.items():
+            if family in families_seen:
+                continue
+            families_seen.add(family)
+
+            model_name = self.family_model_names.get(family)
+            if model_name and model_name in self.model_factories:
+                model = self.model_factories[model_name](num_classes=self.num_classes)
+                params = [
+                    val.cpu().numpy() for val in model.state_dict().values()
+                ]
+                self.family_global_models[family] = params
+                logger.info(
+                    f"Initialized family global model: {family} -> {model_name} "
+                    f"({len(params)} params)"
+                )
+
     def initialize_parameters(
         self, client_manager: fl.server.client_manager.ClientManager
     ):
@@ -147,6 +187,10 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         """Configure the next round of training, sending model params to clients."""
         logger.info(f"Round {server_round}: configure_fit")
         self.metrics_collector.start_round()
+
+        # Initialize family global models on first round (faithful mode)
+        if self._is_heterofl_faithful():
+            self._initialize_family_models()
 
         standard_fit_ins = super().configure_fit(
             server_round, parameters, client_manager
@@ -179,15 +223,24 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 1 + math.cos(math.pi * progress)
             )
 
-            # Send matching model: per-client (FedGen-only) or per-signature
-            sig = self.client_model_signatures.get(cid)
-            if not self.enable_heterofl and cid in self.client_models:
+            # Faithful HeteroFL mode: distribute sub-models from family global
+            if self._is_heterofl_faithful() and family in self.family_global_models:
+                model_rate = self.client_model_rates.get(cid, 1.0)
+                new_config["model_rate"] = model_rate
+                family_global = self.family_global_models[family]
+                model_ndarrays = self.hetero_aggregator.distribute(
+                    family_global, cid, model_rate
+                )
+            # Legacy per-signature mode
+            elif not self.enable_heterofl and cid in self.client_models:
                 model_ndarrays = self.client_models[cid]
-            elif sig and sig in self.global_models:
-                model_ndarrays = self.global_models[sig]
             else:
-                model_ndarrays = []
-                new_config["use_local_init"] = True
+                sig = self.client_model_signatures.get(cid)
+                if sig and sig in self.global_models:
+                    model_ndarrays = self.global_models[sig]
+                else:
+                    model_ndarrays = []
+                    new_config["use_local_init"] = True
 
             client_parameters = ndarrays_to_parameters(model_ndarrays)
             new_fit_ins.append((client, FitIns(client_parameters, new_config)))
@@ -246,8 +299,51 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 signature_results[sig] = []
             signature_results[sig].append((cid, params, fit_res.num_examples, family))
 
-        if self.enable_heterofl:
-            # HeteroFL aggregation per signature group
+        if self._is_heterofl_faithful() and self.enable_heterofl:
+            # Faithful HeteroFL: aggregate by family using distribute/aggregate
+            family_results: dict[str, list[tuple[str, list[np.ndarray], int]]] = {}
+            for sig, items in signature_results.items():
+                for cid, params, num_ex, family in items:
+                    if family not in family_results:
+                        family_results[family] = []
+                    family_results[family].append((cid, params, num_ex))
+
+            for family, items in family_results.items():
+                if family not in self.family_global_models:
+                    logger.warning(
+                        f"Family {family} not in family_global_models, skipping"
+                    )
+                    continue
+
+                family_global = self.family_global_models[family]
+
+                # Build label splits for output layer aggregation
+                client_label_splits: dict[str, list[int]] = {}
+                for cid, _params, _num_ex in items:
+                    label_split = self._get_label_split(cid)
+                    if label_split is not None:
+                        client_label_splits[cid] = label_split
+
+                updated_params = self.hetero_aggregator.aggregate(
+                    family=family,
+                    results=items,
+                    global_params=family_global,
+                    client_label_splits=client_label_splits or None,
+                )
+                self.family_global_models[family] = parameters_to_ndarrays(
+                    updated_params
+                )
+
+                logger.info(
+                    f"Family {family}: faithful aggregated {len(items)} clients"
+                )
+
+            # Also keep global_models updated for Flower return value
+            for family, params in self.family_global_models.items():
+                self.global_models[family] = params
+
+        elif self.enable_heterofl:
+            # Legacy HeteroFL aggregation per signature group
             for sig, items in signature_results.items():
                 if sig not in self.global_models:
                     first_params = items[0][1]
@@ -283,11 +379,12 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             logger.info(f"FedGen-only mode: stored {len(results)} per-client models")
 
         # FedGen: Train generator + distill models after aggregation
-        num_available = (
-            len(self.client_models)
-            if not self.enable_heterofl
-            else len(self.global_models)
-        )
+        if self._is_heterofl_faithful():
+            num_available = len(self.family_global_models)
+        elif not self.enable_heterofl:
+            num_available = len(self.client_models)
+        else:
+            num_available = len(self.global_models)
         if self.enable_fedgen and num_available >= 2:
             self._train_generator_on_server(server_round)
 
@@ -317,7 +414,33 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         # Reconstruct nn.Module from stored numpy arrays
         torch_models: dict[str, nn.Module] = {}
 
-        if not self.enable_heterofl and self.client_models:
+        if self._is_heterofl_faithful() and self.family_global_models:
+            # Faithful HeteroFL: per-family full-width models
+            for family, np_params in self.family_global_models.items():
+                model_name = self.family_model_names.get(family)
+                if model_name and model_name in self.model_factories:
+                    model = self.model_factories[model_name](
+                        num_classes=self.num_classes
+                    )
+                    state_dict = model.state_dict()
+                    keys = list(state_dict.keys())
+                    if len(keys) == len(np_params):
+                        for key, arr in zip(keys, np_params):
+                            state_dict[key] = torch.from_numpy(arr.copy())
+                        model.load_state_dict(state_dict)
+                        model.to(self.fedgen_distiller.device)
+                        torch_models[family] = model
+                    else:
+                        logger.warning(
+                            f"Param count mismatch for family={family}: "
+                            f"model has {len(keys)}, stored {len(np_params)}"
+                        )
+                else:
+                    logger.debug(
+                        f"No factory for family={family} "
+                        f"(model_name={model_name})"
+                    )
+        elif not self.enable_heterofl and self.client_models:
             # FedGen-only: per-client models
             for cid, np_params in self.client_models.items():
                 model_name = self.client_model_names.get(cid)
@@ -341,7 +464,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 else:
                     logger.debug(f"No factory for cid={cid} (model_name={model_name})")
         else:
-            # HeteroFL / AFAD: per-signature models
+            # Legacy HeteroFL / AFAD: per-signature models
             for sig, np_params in self.global_models.items():
                 model_name = self.sig_to_model_name.get(sig)
                 if model_name and model_name in self.model_factories:
@@ -371,7 +494,23 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             return
 
         # Compute label weights
-        if not self.enable_heterofl and self.client_models:
+        if self._is_heterofl_faithful() and self.family_global_models:
+            # Faithful HeteroFL: aggregate per-client counts to per-family
+            family_label_counts: dict[str, list[int]] = {}
+            for cid, counts in self.client_label_counts.items():
+                family = self.client_family_map.get(cid)
+                if family and family in torch_models:
+                    if family not in family_label_counts:
+                        family_label_counts[family] = [0] * self.num_classes
+                    for i, c in enumerate(counts):
+                        if i < self.num_classes:
+                            family_label_counts[family][i] += c
+            label_counts_list = [
+                family_label_counts[f]
+                for f in torch_models
+                if f in family_label_counts
+            ]
+        elif not self.enable_heterofl and self.client_models:
             # FedGen-only: per-client counts (naturally aligned with per-client models)
             label_counts_list = [
                 self.client_label_counts[cid]
@@ -379,7 +518,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 if cid in self.client_label_counts
             ]
         else:
-            # HeteroFL / AFAD: aggregate per-client counts to per-signature
+            # Legacy HeteroFL / AFAD: aggregate per-client counts to per-signature
             sig_label_counts: dict[str, list[int]] = {}
             for cid, counts in self.client_label_counts.items():
                 sig = self.client_model_signatures.get(cid)
@@ -430,7 +569,17 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
             # Write distilled model params back
             if distill_losses:
-                if not self.enable_heterofl:
+                if self._is_heterofl_faithful() and self.family_global_models:
+                    # Faithful HeteroFL: write back to family_global_models
+                    for family, model in torch_models.items():
+                        self.family_global_models[family] = [
+                            val.cpu().detach().numpy()
+                            for val in model.state_dict().values()
+                        ]
+                        self.global_models[family] = (
+                            self.family_global_models[family]
+                        )
+                elif not self.enable_heterofl:
                     # FedGen-only: write back to per-client models
                     for cid, model in torch_models.items():
                         self.client_models[cid] = [
@@ -438,7 +587,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                             for val in model.state_dict().values()
                         ]
                 else:
-                    # HeteroFL / AFAD: write back to global_models
+                    # Legacy HeteroFL / AFAD: write back to global_models
                     for sig, model in torch_models.items():
                         self.global_models[sig] = [
                             val.cpu().detach().numpy()
@@ -468,13 +617,27 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             config = dict(eval_ins.config)
             config["round"] = server_round
 
-            sig = self.client_model_signatures.get(cid)
-            if not self.enable_heterofl and cid in self.client_models:
+            # Faithful HeteroFL: distribute sub-model for evaluation
+            family = self.client_family_map.get(cid)
+            if (
+                self._is_heterofl_faithful()
+                and family
+                and family in self.family_global_models
+            ):
+                model_rate = self.client_model_rates.get(cid, 1.0)
+                family_global = self.family_global_models[family]
+                sub_params = self.hetero_aggregator.distribute(
+                    family_global, cid, model_rate
+                )
+                client_params = ndarrays_to_parameters(sub_params)
+            elif not self.enable_heterofl and cid in self.client_models:
                 client_params = ndarrays_to_parameters(self.client_models[cid])
-            elif sig and sig in self.global_models:
-                client_params = ndarrays_to_parameters(self.global_models[sig])
             else:
-                client_params = eval_ins.parameters
+                sig = self.client_model_signatures.get(cid)
+                if sig and sig in self.global_models:
+                    client_params = ndarrays_to_parameters(self.global_models[sig])
+                else:
+                    client_params = eval_ins.parameters
 
             new_eval_ins.append((client, EvaluateIns(client_params, config)))
 
