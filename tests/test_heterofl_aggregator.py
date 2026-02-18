@@ -524,5 +524,146 @@ class TestHeteroFLEdgeCases:
         assert len(idx_scaled[0][0]) == 5  # Output scaled
 
 
+class TestHeteroFLPreservedTailLayers:
+    """Tests for num_preserved_tail_layers (AFAD with FedGenModelWrapper)."""
+
+    def test_find_output_layer_indices_two_layers(self):
+        """num_preserved_tail_layers=2 should protect bottleneck + classifier."""
+        global_params = [
+            np.zeros((16, 3, 3, 3)),  # Conv weight
+            np.zeros(16),  # Conv bias
+            np.zeros((32, 16)),  # bottleneck weight (latent_dim=32)
+            np.zeros(32),  # bottleneck bias
+            np.zeros((10, 32)),  # classifier weight
+            np.zeros(10),  # classifier bias
+        ]
+
+        indices = HeteroFLAggregator._find_output_layer_indices(
+            global_params, num_preserved_tail_layers=2
+        )
+        # Should protect both 2D layers and their biases
+        assert indices == {2, 3, 4, 5}
+
+    def test_distribute_preserves_bottleneck_output_dim(self):
+        """At rate=0.5, bottleneck output (32) and classifier must be fully preserved."""
+        aggregator = HeteroFLAggregator()
+
+        global_params = [
+            np.ones((16, 3, 3, 3)),  # Conv
+            np.ones(16),  # Conv bias
+            np.ones((32, 16)),  # bottleneck [latent_dim=32, features=16]
+            np.ones(32),  # bottleneck bias
+            np.ones((10, 32)),  # classifier [num_classes=10, latent_dim=32]
+            np.ones(10),  # classifier bias
+        ]
+
+        sub_params = aggregator.distribute(
+            global_params,
+            "c1",
+            model_rate=0.5,
+            num_preserved_tail_layers=2,
+        )
+
+        # Conv: scaled to (8, 2, 3, 3)
+        assert sub_params[0].shape == (8, 2, 3, 3)
+        assert sub_params[1].shape == (8,)
+
+        # bottleneck: output_dim=32 preserved, input follows conv=8
+        assert sub_params[2].shape == (32, 8)
+        assert sub_params[3].shape == (32,)
+
+        # classifier: fully preserved (10, 32)
+        assert sub_params[4].shape == (10, 32)
+        assert sub_params[5].shape == (10,)
+
+    def test_aggregate_with_preserved_tail_layers(self):
+        """Aggregation with num_preserved_tail_layers=2 round-trips correctly."""
+        aggregator = HeteroFLAggregator()
+
+        global_params = [
+            np.zeros((16, 3, 3, 3)),
+            np.zeros(16),
+            np.zeros((32, 16)),  # bottleneck
+            np.zeros(32),
+            np.zeros((10, 32)),  # classifier
+            np.zeros(10),
+        ]
+
+        aggregator.distribute(
+            global_params,
+            "c1",
+            model_rate=1.0,
+            num_preserved_tail_layers=2,
+        )
+        aggregator.distribute(
+            global_params,
+            "c2",
+            model_rate=0.5,
+            num_preserved_tail_layers=2,
+        )
+
+        # c1: full model
+        c1_params = [
+            np.ones((16, 3, 3, 3)) * 10.0,
+            np.ones(16) * 10.0,
+            np.ones((32, 16)) * 10.0,
+            np.ones(32) * 10.0,
+            np.ones((10, 32)) * 10.0,
+            np.ones(10) * 10.0,
+        ]
+        # c2: sub-model at rate=0.5
+        c2_params = [
+            np.ones((8, 2, 3, 3)) * 20.0,
+            np.ones(8) * 20.0,
+            np.ones((32, 8)) * 20.0,  # bottleneck output preserved
+            np.ones(32) * 20.0,
+            np.ones((10, 32)) * 20.0,  # classifier fully preserved
+            np.ones(10) * 20.0,
+        ]
+
+        results = [
+            ("c1", c1_params, 100),
+            ("c2", c2_params, 100),
+        ]
+
+        updated = parameters_to_ndarrays(
+            aggregator.aggregate(
+                "test",
+                results,
+                global_params,
+                num_preserved_tail_layers=2,
+            )
+        )
+
+        # classifier: both contribute → avg = 15
+        np.testing.assert_allclose(updated[4], np.ones((10, 32)) * 15.0)
+        np.testing.assert_allclose(updated[5], np.ones(10) * 15.0)
+
+        # bottleneck output dim preserved: first 8 cols averaged, rest from c1 only
+        np.testing.assert_allclose(updated[2][:, :8], np.ones((32, 8)) * 15.0)
+        np.testing.assert_allclose(updated[2][:, 8:], np.ones((32, 8)) * 10.0)
+
+    def test_backward_compat_one_layer(self):
+        """Default num_preserved_tail_layers=1 matches old behavior."""
+        global_params = [
+            np.zeros((32, 16)),  # bottleneck
+            np.zeros(32),
+            np.zeros((10, 32)),  # classifier
+            np.zeros(10),
+        ]
+
+        indices_1 = HeteroFLAggregator._find_output_layer_indices(
+            global_params, num_preserved_tail_layers=1
+        )
+        # Only classifier protected
+        assert indices_1 == {2, 3}
+
+        indices_2 = HeteroFLAggregator._find_output_layer_indices(
+            global_params, num_preserved_tail_layers=2
+        )
+        # Both bottleneck and classifier protected
+        assert indices_2 == {0, 1, 2, 3}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

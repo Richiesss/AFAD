@@ -1,10 +1,10 @@
-"""Tests for FedProx proximal regularization in AFADClient."""
+"""Tests for FedProx proximal regularization in HeteroFLClient."""
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.client.afad_client import AFADClient
+from src.client.heterofl_client import HeteroFLClient
 
 
 def _make_simple_model() -> nn.Module:
@@ -34,7 +34,7 @@ class TestFedProxRegularization:
         loader = _make_loader()
 
         # Train with mu=0 (FedProx disabled)
-        client_a = AFADClient(
+        client_a = HeteroFLClient(
             cid="0",
             model=model_a,
             train_loader=loader,
@@ -48,7 +48,7 @@ class TestFedProxRegularization:
         # Train with default (no fedprox_mu in config)
         torch.manual_seed(0)
         model_b = _make_simple_model()
-        client_b = AFADClient(
+        client_b = HeteroFLClient(
             cid="1",
             model=model_b,
             train_loader=loader,
@@ -78,7 +78,7 @@ class TestFedProxRegularization:
         # Train WITHOUT FedProx
         torch.manual_seed(42)
         model_no_prox = _make_simple_model()
-        client_no_prox = AFADClient(
+        client_no_prox = HeteroFLClient(
             cid="0",
             model=model_no_prox,
             train_loader=loader,
@@ -91,7 +91,7 @@ class TestFedProxRegularization:
         # Train WITH FedProx (mu=1.0, strong regularization for clear effect)
         torch.manual_seed(42)
         model_prox = _make_simple_model()
-        client_prox = AFADClient(
+        client_prox = HeteroFLClient(
             cid="1",
             model=model_prox,
             train_loader=loader,
@@ -122,7 +122,7 @@ class TestFedProxRegularization:
         model = _make_simple_model()
         global_ndarrays = [p.detach().numpy() for p in model.parameters()]
 
-        client = AFADClient(
+        client = HeteroFLClient(
             cid="0",
             model=model,
             train_loader=loader,
@@ -149,7 +149,7 @@ class TestFedProxRegularization:
             global_params = [p.clone().detach() for p in model.parameters()]
             global_ndarrays = [p.numpy() for p in global_params]
 
-            client = AFADClient(
+            client = HeteroFLClient(
                 cid="0",
                 model=model,
                 train_loader=loader,

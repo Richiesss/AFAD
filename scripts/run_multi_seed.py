@@ -26,7 +26,10 @@ from scipy import stats
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from scripts.run_comparison import (
-    get_client_mappings,
+    CID_TO_FAMILY_P3,
+    CID_TO_MODEL_P3,
+    CID_TO_RATE_P3,
+    FAMILY_MODEL_NAMES_P3,
     print_comparison_table,
     run_single_experiment,
 )
@@ -40,7 +43,7 @@ DEFAULT_SEEDS = [42, 123, 456, 789, 1024, 2025, 3141, 4096, 5555, 7777]
 
 METHODS = [
     {"label": "HeteroFL Only", "enable_fedgen": False, "enable_heterofl": True},
-    {"label": "KD Only", "enable_fedgen": True, "enable_heterofl": False},
+    {"label": "FedGen Only", "enable_fedgen": True, "enable_heterofl": False},
     {"label": "AFAD Hybrid", "enable_fedgen": True, "enable_heterofl": True},
 ]
 
@@ -93,9 +96,6 @@ def run_seed(
     num_rounds = config_dict["experiment"].get("num_rounds", 40)
     local_epochs = config_dict.get("training", {}).get("local_epochs", 3)
     batch_size = config_dict["data"].get("batch_size", 64)
-    fedprox_mu = config_dict.get("training", {}).get("fedprox_mu", 0.0)
-
-    cid_to_model, cid_to_family = get_client_mappings(num_clients)
 
     # Load data with this seed
     if dataset_name == "organamnist":
@@ -120,16 +120,15 @@ def run_seed(
     exp_kwargs = {
         "train_loaders": train_loaders,
         "test_loader": test_loader,
-        "cid_to_model": cid_to_model,
-        "cid_to_family": cid_to_family,
+        "cid_to_model": CID_TO_MODEL_P3,
+        "cid_to_family": CID_TO_FAMILY_P3,
+        "cid_to_rate": CID_TO_RATE_P3,
+        "family_model_names": FAMILY_MODEL_NAMES_P3,
         "num_classes": num_classes,
         "num_clients": num_clients,
         "num_rounds": num_rounds,
         "local_epochs": local_epochs,
-        "ds_mean": ds_cfg.mean[0],
-        "ds_std": ds_cfg.std[0],
         "seed": seed,
-        "fedprox_mu": fedprox_mu,
     }
 
     seed_results = {}
@@ -199,7 +198,7 @@ def compute_statistics(all_results: dict) -> dict:
     afad_best = np.array(method_metrics["AFAD Hybrid"]["best_accuracy"])
     afad_final = np.array(method_metrics["AFAD Hybrid"]["final_accuracy"])
 
-    for baseline in ["HeteroFL Only", "KD Only"]:
+    for baseline in ["HeteroFL Only", "FedGen Only"]:
         base_best = np.array(method_metrics[baseline]["best_accuracy"])
         base_final = np.array(method_metrics[baseline]["final_accuracy"])
 

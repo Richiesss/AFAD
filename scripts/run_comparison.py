@@ -1,5 +1,5 @@
 """
-Compare HeteroFL-only, KD-only, and AFAD hybrid (HeteroFL + FedGen).
+Compare HeteroFL-only, FedGen-only, and AFAD hybrid (HeteroFL + FedGen).
 
 Runs 3 Flower simulations sequentially with the same data split and
 collects per-round accuracy/loss for each method.
@@ -26,51 +26,17 @@ import src.models.vit.deit  # noqa: F401
 import src.models.vit.heterofl_vit  # noqa: F401
 import src.models.vit.vit  # noqa: F401
 from src.client.afad_client import AFADClient
+from src.client.fedgen_client import FedGenClient
+from src.client.heterofl_client import HeteroFLClient
 from src.data.dataset_config import get_dataset_config
 from src.data.mnist_loader import load_mnist_data
+from src.models.fedgen_wrapper import FedGenModelWrapper
 from src.models.registry import ModelRegistry
-from src.routing.family_router import FamilyRouter
-from src.server.generator.synthetic_generator import SyntheticGenerator
+from src.server.generator.fedgen_generator import FedGenGenerator
 from src.server.strategy.afad_strategy import AFADStrategy
 from src.utils.logger import setup_logger
 
 logger = setup_logger("Comparison")
-
-# Phase 1: 5 clients, 5 unique architectures
-CID_TO_MODEL_5 = {
-    "0": "resnet50",
-    "1": "mobilenetv3_large",
-    "2": "resnet18",
-    "3": "vit_tiny",
-    "4": "deit_small",
-}
-CID_TO_FAMILY_5 = {"0": "cnn", "1": "cnn", "2": "cnn", "3": "vit", "4": "vit"}
-
-# Phase 2: 10 clients, 5 architectures x 2
-CID_TO_MODEL_10 = {
-    "0": "resnet50",
-    "1": "resnet50",
-    "2": "mobilenetv3_large",
-    "3": "mobilenetv3_large",
-    "4": "resnet18",
-    "5": "resnet18",
-    "6": "vit_tiny",
-    "7": "vit_tiny",
-    "8": "deit_small",
-    "9": "deit_small",
-}
-CID_TO_FAMILY_10 = {
-    "0": "cnn",
-    "1": "cnn",
-    "2": "cnn",
-    "3": "cnn",
-    "4": "cnn",
-    "5": "cnn",
-    "6": "vit",
-    "7": "vit",
-    "8": "vit",
-    "9": "vit",
-}
 
 # Phase 3: 10 clients, 2 families with width-scaled sub-models
 CID_TO_MODEL_P3 = {
@@ -114,6 +80,8 @@ FAMILY_MODEL_NAMES_P3 = {
     "vit": "heterofl_vit_small",
 }
 
+LATENT_DIM = 32
+
 device_type = "cuda" if torch.cuda.is_available() else "cpu"
 num_gpus = 0.15 if device_type == "cuda" else 0.0
 CLIENT_RESOURCES = {"num_cpus": 1.0, "num_gpus": num_gpus}
@@ -123,24 +91,10 @@ def get_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def get_client_mappings(
-    num_clients: int,
-    phase: int = 0,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Return (cid_to_model, cid_to_family) for the given client count.
-
-    Args:
-        num_clients: Number of clients.
-        phase: Experiment phase (3 = faithful HeteroFL).
-    """
-    if phase == 3:
-        return CID_TO_MODEL_P3, CID_TO_FAMILY_P3
-    if num_clients <= 5:
-        return CID_TO_MODEL_5, CID_TO_FAMILY_5
-    return CID_TO_MODEL_10, CID_TO_FAMILY_10
-
-
-def build_model_factories(cid_to_model: dict[str, str]) -> dict[str, callable]:
+def build_plain_model_factories(
+    cid_to_model: dict[str, str],
+) -> dict[str, callable]:
+    """Build factories that create plain (unwrapped) models."""
     model_names = set(cid_to_model.values())
     factories = {}
     for name in model_names:
@@ -150,35 +104,144 @@ def build_model_factories(cid_to_model: dict[str, str]) -> dict[str, callable]:
     return factories
 
 
-def client_fn_builder(
+def build_wrapped_model_factories(
+    family_model_names: dict[str, str],
+    latent_dim: int = LATENT_DIM,
+) -> dict[str, callable]:
+    """Build factories that create FedGenModelWrapper-wrapped models.
+
+    For AFAD/FedGen modes, the server needs to reconstruct wrapped models
+    with forward_from_latent support for generator training.
+    """
+    factories = {}
+    for _family, name in family_model_names.items():
+        if name not in factories:
+            factories[name] = lambda num_classes=10, _n=name, _ld=latent_dim: (
+                FedGenModelWrapper(
+                    ModelRegistry.create_model(_n, num_classes=num_classes),
+                    latent_dim=_ld,
+                    num_classes=num_classes,
+                )
+            )
+    return factories
+
+
+def heterofl_client_fn_builder(
     train_loaders,
     test_loader,
     cid_to_model: dict[str, str],
     cid_to_family: dict[str, str],
     num_classes: int,
     local_epochs: int,
-    cid_to_rate: dict[str, float] | None = None,
+    cid_to_rate: dict[str, float],
 ):
+    """Build client_fn for HeteroFL Only (plain models, no KD)."""
+
     def client_fn(cid: str) -> fl.client.Client:
         import src.models.cnn.heterofl_resnet  # noqa: F401
-        import src.models.cnn.mobilenet  # noqa: F401
-        import src.models.cnn.resnet  # noqa: F401
-        import src.models.vit.deit  # noqa: F401
         import src.models.vit.heterofl_vit  # noqa: F401
-        import src.models.vit.vit  # noqa: F401
 
-        model_name = cid_to_model.get(cid, "resnet18")
+        model_name = cid_to_model.get(cid, "heterofl_resnet18")
         family = cid_to_family.get(cid, "cnn")
-        model_rate = cid_to_rate.get(cid, 1.0) if cid_to_rate else 1.0
+        model_rate = cid_to_rate.get(cid, 1.0)
         device = get_device()
         model = ModelRegistry.create_model(
             model_name, num_classes=num_classes, model_rate=model_rate
         )
         train_loader = train_loaders[int(cid) % len(train_loaders)]
 
+        return HeteroFLClient(
+            cid=cid,
+            model=model,
+            train_loader=train_loader,
+            val_loader=test_loader,
+            epochs=local_epochs,
+            device=device,
+            family=family,
+            model_rate=model_rate,
+            model_name=model_name,
+            num_classes=num_classes,
+        ).to_client()
+
+    return client_fn
+
+
+def fedgen_client_fn_builder(
+    train_loaders,
+    test_loader,
+    cid_to_model: dict[str, str],
+    cid_to_family: dict[str, str],
+    num_classes: int,
+    local_epochs: int,
+):
+    """Build client_fn for FedGen Only (wrapped models at rate=1.0, KD)."""
+
+    def client_fn(cid: str) -> fl.client.Client:
+        import src.models.cnn.heterofl_resnet  # noqa: F401
+        import src.models.vit.heterofl_vit  # noqa: F401
+
+        model_name = cid_to_model.get(cid, "heterofl_resnet18")
+        device = get_device()
+        base_model = ModelRegistry.create_model(model_name, num_classes=num_classes)
+        model = FedGenModelWrapper(
+            base_model, latent_dim=LATENT_DIM, num_classes=num_classes
+        )
+        generator = FedGenGenerator(
+            noise_dim=LATENT_DIM,
+            num_classes=num_classes,
+            latent_dim=LATENT_DIM,
+        )
+        train_loader = train_loaders[int(cid) % len(train_loaders)]
+
+        return FedGenClient(
+            cid=cid,
+            model=model,
+            generator=generator,
+            train_loader=train_loader,
+            epochs=local_epochs,
+            device=device,
+            num_classes=num_classes,
+        ).to_client()
+
+    return client_fn
+
+
+def afad_client_fn_builder(
+    train_loaders,
+    test_loader,
+    cid_to_model: dict[str, str],
+    cid_to_family: dict[str, str],
+    num_classes: int,
+    local_epochs: int,
+    cid_to_rate: dict[str, float],
+):
+    """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
+
+    def client_fn(cid: str) -> fl.client.Client:
+        import src.models.cnn.heterofl_resnet  # noqa: F401
+        import src.models.vit.heterofl_vit  # noqa: F401
+
+        model_name = cid_to_model.get(cid, "heterofl_resnet18")
+        family = cid_to_family.get(cid, "cnn")
+        model_rate = cid_to_rate.get(cid, 1.0)
+        device = get_device()
+        base_model = ModelRegistry.create_model(
+            model_name, num_classes=num_classes, model_rate=model_rate
+        )
+        model = FedGenModelWrapper(
+            base_model, latent_dim=LATENT_DIM, num_classes=num_classes
+        )
+        generator = FedGenGenerator(
+            noise_dim=LATENT_DIM,
+            num_classes=num_classes,
+            latent_dim=LATENT_DIM,
+        )
+        train_loader = train_loaders[int(cid) % len(train_loaders)]
+
         return AFADClient(
             cid=cid,
             model=model,
+            generator=generator,
             train_loader=train_loader,
             val_loader=test_loader,
             epochs=local_epochs,
@@ -202,52 +265,55 @@ def evaluate_metrics_aggregation_fn(
     return {"accuracy": accuracy}
 
 
-def run_single_experiment(
-    label: str,
-    train_loaders,
-    test_loader,
+def _build_strategy(
     enable_fedgen: bool,
-    cid_to_model: dict[str, str],
-    cid_to_family: dict[str, str],
+    enable_heterofl: bool,
     num_classes: int,
     num_clients: int,
     num_rounds: int,
-    local_epochs: int,
-    ds_mean: float,
-    ds_std: float,
-    seed: int = 42,
-    fedprox_mu: float = 0.0,
-    enable_heterofl: bool = True,
-    cid_to_rate: dict[str, float] | None = None,
-    family_model_names: dict[str, str] | None = None,
-) -> list[dict]:
-    """Run one Flower simulation and return per-round metrics."""
-    logger.info(f"{'=' * 60}")
-    logger.info(f"Starting experiment: {label}")
-    logger.info(
-        f"  enable_fedgen={enable_fedgen}, enable_heterofl={enable_heterofl}, "
-        f"clients={num_clients}"
-    )
-    logger.info(f"{'=' * 60}")
+    cid_to_family: dict[str, str],
+    cid_to_rate: dict[str, float] | None,
+    family_model_names: dict[str, str],
+) -> AFADStrategy:
+    """Build AFADStrategy with appropriate configuration."""
+    device = get_device()
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # Generator (None for HeteroFL Only)
+    generator = None
+    if enable_fedgen:
+        generator = FedGenGenerator(
+            noise_dim=LATENT_DIM,
+            num_classes=num_classes,
+            latent_dim=LATENT_DIM,
+        )
 
-    family_router = FamilyRouter()
-    generator = SyntheticGenerator(
-        noise_dim=32,
-        num_classes=num_classes,
-        hidden_dim=256,
-        mean=ds_mean,
-        std=ds_std,
-    )
-    model_factories = build_model_factories(cid_to_model)
+    # Model factories
+    if enable_fedgen:
+        model_factories = build_wrapped_model_factories(
+            family_model_names, latent_dim=LATENT_DIM
+        )
+    else:
+        model_factories = build_plain_model_factories(
+            {
+                str(i): name
+                for i, name in enumerate(
+                    [family_model_names[f] for f in sorted(family_model_names)]
+                )
+            }
+        )
 
-    # Use first model name from cid_to_model for initial params
-    first_model_name = next(iter(cid_to_model.values()), "resnet18")
-    initial_model = ModelRegistry.create_model(
-        first_model_name, num_classes=num_classes
-    )
+    # Initial params (just for Flower framework, not actually used)
+    first_model_name = next(iter(family_model_names.values()))
+    if enable_fedgen:
+        initial_model = FedGenModelWrapper(
+            ModelRegistry.create_model(first_model_name, num_classes=num_classes),
+            latent_dim=LATENT_DIM,
+            num_classes=num_classes,
+        )
+    else:
+        initial_model = ModelRegistry.create_model(
+            first_model_name, num_classes=num_classes
+        )
     initial_params = fl.common.ndarrays_to_parameters(
         [val.cpu().numpy() for val in initial_model.state_dict().values()]
     )
@@ -259,38 +325,25 @@ def run_single_experiment(
         "ensemble_eta": 1.0,
         "gen_epochs": 2,
         "teacher_iters": 25,
-        "temperature": 4.0,
-        "distill_lr": 1e-4,
-        "distill_epochs": 1,
-        "distill_steps": 5,
-        "distill_alpha": 1.0,
-        "distill_beta": 0.1,
-        "distill_every": 2,
-        "device": get_device(),
+        "device": device,
     }
 
     training_config = {
         "lr": 0.01,
         "momentum": 0.9,
         "weight_decay": 0.0001,
-        "local_epochs": local_epochs,
-        "fedprox_mu": fedprox_mu,
+        "local_epochs": 3,
+        "fedprox_mu": 0.0,
     }
 
-    # Build client_model_rates from cid_to_rate
-    client_model_rates = cid_to_rate if cid_to_rate else None
-
-    # Pre-set client families for faithful mode
-    strategy_kwargs: dict = {}
-    if family_model_names:
-        strategy_kwargs["family_model_names"] = family_model_names
+    client_model_rates = cid_to_rate if enable_heterofl else None
 
     strategy = AFADStrategy(
         initial_parameters=initial_params,
-        initial_generator=generator,
-        family_router=family_router,
+        generator=generator,
         model_factories=model_factories,
         client_model_rates=client_model_rates,
+        family_model_names=family_model_names,
         fedgen_config=fedgen_config,
         training_config=training_config,
         enable_fedgen=enable_fedgen,
@@ -303,23 +356,92 @@ def run_single_experiment(
         fraction_evaluate=1.0,
         min_evaluate_clients=num_clients,
         evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
-        **strategy_kwargs,
     )
 
-    # Pre-register client families for faithful mode initialization
-    if cid_to_rate:
-        for cid, family in cid_to_family.items():
-            strategy.set_client_family(cid, family)
+    # Pre-register client families
+    for cid, family in cid_to_family.items():
+        strategy.set_client_family(cid, family)
 
-    client_fn = client_fn_builder(
-        train_loaders,
-        test_loader,
-        cid_to_model,
-        cid_to_family,
-        num_classes,
-        local_epochs,
+    return strategy
+
+
+def run_single_experiment(
+    label: str,
+    train_loaders,
+    test_loader,
+    enable_fedgen: bool,
+    enable_heterofl: bool,
+    num_classes: int,
+    num_clients: int,
+    num_rounds: int,
+    local_epochs: int,
+    seed: int = 42,
+    cid_to_model: dict[str, str] | None = None,
+    cid_to_family: dict[str, str] | None = None,
+    cid_to_rate: dict[str, float] | None = None,
+    family_model_names: dict[str, str] | None = None,
+) -> list[dict]:
+    """Run one Flower simulation and return per-round metrics."""
+    cid_to_model = cid_to_model or CID_TO_MODEL_P3
+    cid_to_family = cid_to_family or CID_TO_FAMILY_P3
+    cid_to_rate = cid_to_rate or CID_TO_RATE_P3
+    family_model_names = family_model_names or FAMILY_MODEL_NAMES_P3
+
+    logger.info(f"{'=' * 60}")
+    logger.info(f"Starting experiment: {label}")
+    logger.info(
+        f"  enable_fedgen={enable_fedgen}, enable_heterofl={enable_heterofl}, "
+        f"clients={num_clients}"
+    )
+    logger.info(f"{'=' * 60}")
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    strategy = _build_strategy(
+        enable_fedgen=enable_fedgen,
+        enable_heterofl=enable_heterofl,
+        num_classes=num_classes,
+        num_clients=num_clients,
+        num_rounds=num_rounds,
+        cid_to_family=cid_to_family,
         cid_to_rate=cid_to_rate,
+        family_model_names=family_model_names,
     )
+
+    # Build client_fn based on experiment mode
+    if enable_heterofl and enable_fedgen:
+        # AFAD Hybrid
+        client_fn = afad_client_fn_builder(
+            train_loaders,
+            test_loader,
+            cid_to_model,
+            cid_to_family,
+            num_classes,
+            local_epochs,
+            cid_to_rate,
+        )
+    elif enable_fedgen:
+        # FedGen Only (rate=1.0 for all)
+        client_fn = fedgen_client_fn_builder(
+            train_loaders,
+            test_loader,
+            cid_to_model,
+            cid_to_family,
+            num_classes,
+            local_epochs,
+        )
+    else:
+        # HeteroFL Only
+        client_fn = heterofl_client_fn_builder(
+            train_loaders,
+            test_loader,
+            cid_to_model,
+            cid_to_family,
+            num_classes,
+            local_epochs,
+            cid_to_rate,
+        )
 
     fl.simulation.start_simulation(
         client_fn=client_fn,
@@ -329,11 +451,9 @@ def run_single_experiment(
         client_resources=CLIENT_RESOURCES,
     )
 
-    # Ensure Ray is shut down before next experiment
     if ray.is_initialized():
         ray.shutdown()
 
-    # Collect per-round metrics
     rounds = []
     for rm in strategy.metrics_collector.rounds:
         rounds.append(
@@ -358,7 +478,6 @@ def print_comparison_table(results: dict[str, list[dict]]) -> None:
     labels = list(results.keys())
     num_rounds = max(len(v) for v in results.values())
 
-    # Header
     header = f"{'Round':>5}"
     for label in labels:
         header += f" | {label:>22}"
@@ -381,7 +500,6 @@ def print_comparison_table(results: dict[str, list[dict]]) -> None:
                 row += f" | {'N/A':>21}"
         print(row)
 
-    # Summary row
     print(separator)
     row = f"{'BEST':>5}"
     for label in labels:
@@ -395,54 +513,18 @@ def print_comparison_table(results: dict[str, list[dict]]) -> None:
         row += f" | {final:>21.2%}"
     print(row)
 
-    # Loss comparison
-    print("\n")
-    print("=" * len(header))
-    print("  COMPARISON: Loss per Round")
-    print("=" * len(header))
-    print(header)
-    print(separator)
-
-    for i in range(num_rounds):
-        row = f"{i + 1:>5}"
-        for label in labels:
-            if i < len(results[label]):
-                loss = results[label][i]["loss"]
-                row += f" | {loss:>21.4f}"
-            else:
-                row += f" | {'N/A':>21}"
-        print(row)
-
-    print(separator)
-    row = f"{'FINAL':>5}"
-    for label in labels:
-        final = results[label][-1]["loss"]
-        row += f" | {final:>21.4f}"
-    print(row)
-
-    # Wall time
     print("\n")
     for label in labels:
         total_time = sum(r["wall_time"] for r in results[label])
         print(f"  {label}: total_time={total_time:.1f}s")
 
 
-def _detect_phase(config_dict: dict) -> int:
-    """Detect experiment phase from config."""
-    strategy_type = config_dict.get("strategy", {}).get("intra_family", "")
-    if strategy_type == "heterofl_faithful":
-        return 3
-    return 0  # Auto-detect from client count
-
-
 def main():
     from src.utils.config_loader import load_config
 
-    # Load config (default: Phase 1)
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config/afad_config.yaml"
     config_dict = load_config(config_path)
 
-    # Dataset
     dataset_name = config_dict["data"].get("dataset", "mnist")
     ds_cfg = get_dataset_config(dataset_name)
     num_classes = ds_cfg.num_classes
@@ -451,21 +533,9 @@ def main():
     local_epochs = config_dict.get("training", {}).get("local_epochs", 3)
     batch_size = config_dict["data"].get("batch_size", 64)
     seed = config_dict["experiment"].get("seed", 42)
-    fedprox_mu = config_dict.get("training", {}).get("fedprox_mu", 0.0)
-
-    # Client mappings
-    phase = _detect_phase(config_dict)
-    cid_to_model, cid_to_family = get_client_mappings(num_clients, phase=phase)
-
-    # Phase 3: faithful HeteroFL with model rates
-    cid_to_rate = CID_TO_RATE_P3 if phase == 3 else None
-    family_model_names = FAMILY_MODEL_NAMES_P3 if phase == 3 else None
 
     logger.info(f"Loading {dataset_name} data for {num_clients} clients...")
-    if phase == 3:
-        logger.info("Phase 3: Faithful HeteroFL with width-scaled sub-models")
 
-    # Data loading
     if dataset_name == "organamnist":
         from src.data.medmnist_loader import load_organamnist_data
 
@@ -483,27 +553,23 @@ def main():
             batch_size=batch_size,
         )
 
-    # Common experiment kwargs
     exp_kwargs = {
         "train_loaders": train_loaders,
         "test_loader": test_loader,
-        "cid_to_model": cid_to_model,
-        "cid_to_family": cid_to_family,
         "num_classes": num_classes,
         "num_clients": num_clients,
         "num_rounds": num_rounds,
         "local_epochs": local_epochs,
-        "ds_mean": ds_cfg.mean[0],
-        "ds_std": ds_cfg.std[0],
         "seed": seed,
-        "fedprox_mu": fedprox_mu,
-        "cid_to_rate": cid_to_rate,
-        "family_model_names": family_model_names,
+        "cid_to_model": CID_TO_MODEL_P3,
+        "cid_to_family": CID_TO_FAMILY_P3,
+        "cid_to_rate": CID_TO_RATE_P3,
+        "family_model_names": FAMILY_MODEL_NAMES_P3,
     }
 
     results: dict[str, list[dict]] = {}
 
-    # --- Experiment 1: HeteroFL Only (no FedGen) ---
+    # --- Experiment 1: HeteroFL Only ---
     results["HeteroFL Only"] = run_single_experiment(
         label="HeteroFL Only",
         enable_fedgen=False,
@@ -511,15 +577,15 @@ def main():
         **exp_kwargs,
     )
 
-    # --- Experiment 2: KD Only (no HeteroFL aggregation) ---
-    results["KD Only"] = run_single_experiment(
-        label="KD Only",
+    # --- Experiment 2: FedGen Only ---
+    results["FedGen Only"] = run_single_experiment(
+        label="FedGen Only",
         enable_fedgen=True,
         enable_heterofl=False,
         **exp_kwargs,
     )
 
-    # --- Experiment 3: AFAD Hybrid (HeteroFL + FedGen) ---
+    # --- Experiment 3: AFAD Hybrid ---
     results["AFAD Hybrid"] = run_single_experiment(
         label="AFAD Hybrid",
         enable_fedgen=True,
@@ -527,7 +593,6 @@ def main():
         **exp_kwargs,
     )
 
-    # --- Print comparison ---
     print_comparison_table(results)
 
 

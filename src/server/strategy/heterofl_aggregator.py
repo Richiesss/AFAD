@@ -23,35 +23,44 @@ class HeteroFLAggregator:
         self.client_param_idx: dict[str, list[tuple]] = {}
 
     @staticmethod
-    def _find_output_layer_indices(global_params: list[np.ndarray]) -> set[int]:
+    def _find_output_layer_indices(
+        global_params: list[np.ndarray],
+        num_preserved_tail_layers: int = 1,
+    ) -> set[int]:
         """
-        Detect the output (classification) layer by finding the last 2D weight
-        and its following 1D bias.
+        Detect preserved (non-width-scaled) layers by finding the last N
+        2D weights and their following 1D biases.
+
+        For vanilla HeteroFL (num_preserved_tail_layers=1), this finds only
+        the classifier layer. For AFAD with FedGenModelWrapper
+        (num_preserved_tail_layers=2), this also preserves the bottleneck
+        layer whose output dim (latent_dim=32) must stay fixed.
 
         In the official HeteroFL, the output layer is identified by name
         ('linear' for resnet, last 'weight'/'bias' for conv). Since Flower
         uses positional arrays without names, we detect by position:
-        the last 2D parameter is the output weight, and any immediately
-        following 1D parameter with matching size is the output bias.
+        the last N 2D parameters are preserved weights, and any immediately
+        following 1D parameter with matching size is the corresponding bias.
         """
         output_indices: set[int] = set()
 
-        # Find last 2D parameter (output weight)
-        last_2d_idx = None
+        # Find last N 2D parameters (scanning from end)
+        found_2d_indices: list[int] = []
         for i in range(len(global_params) - 1, -1, -1):
             if len(global_params[i].shape) == 2:
-                last_2d_idx = i
-                break
+                found_2d_indices.append(i)
+                if len(found_2d_indices) >= num_preserved_tail_layers:
+                    break
 
-        if last_2d_idx is not None:
-            output_indices.add(last_2d_idx)
-            output_dim = global_params[last_2d_idx].shape[0]
+        for idx_2d in found_2d_indices:
+            output_indices.add(idx_2d)
+            output_dim = global_params[idx_2d].shape[0]
 
             # Check if next parameter is the matching bias
-            if last_2d_idx + 1 < len(global_params):
-                next_param = global_params[last_2d_idx + 1]
+            if idx_2d + 1 < len(global_params):
+                next_param = global_params[idx_2d + 1]
                 if len(next_param.shape) == 1 and next_param.shape[0] == output_dim:
-                    output_indices.add(last_2d_idx + 1)
+                    output_indices.add(idx_2d + 1)
 
         return output_indices
 
@@ -60,6 +69,7 @@ class HeteroFLAggregator:
         global_params: list[np.ndarray],
         model_rate: float,
         preserve_output_layer: bool = True,
+        num_preserved_tail_layers: int = 1,
     ) -> list[tuple]:
         """
         Compute sub-model parameter indices based on model_rate.
@@ -72,6 +82,9 @@ class HeteroFLAggregator:
             global_params: Global model parameters as numpy arrays
             model_rate: Client model rate (0.0-1.0), e.g. 0.5 = half width
             preserve_output_layer: If True, output layer keeps full output size
+            num_preserved_tail_layers: Number of tail 2D layers to preserve.
+                1 = classifier only (vanilla HeteroFL).
+                2 = bottleneck + classifier (AFAD with FedGenModelWrapper).
 
         Returns:
             List of index tuples for each parameter
@@ -81,7 +94,7 @@ class HeteroFLAggregator:
 
         # Detect output layer indices
         output_layer_indices = (
-            self._find_output_layer_indices(global_params)
+            self._find_output_layer_indices(global_params, num_preserved_tail_layers)
             if preserve_output_layer
             else set()
         )
@@ -161,7 +174,11 @@ class HeteroFLAggregator:
         return param_idx
 
     def distribute(
-        self, global_params: list[np.ndarray], client_id: str, model_rate: float
+        self,
+        global_params: list[np.ndarray],
+        client_id: str,
+        model_rate: float,
+        num_preserved_tail_layers: int = 1,
     ) -> list[np.ndarray]:
         """
         Extract sub-model from global model for a client.
@@ -169,7 +186,11 @@ class HeteroFLAggregator:
         Uses torch.meshgrid-style indexing (matching the official implementation)
         to extract the sub-model parameters.
         """
-        param_idx = self.compute_param_idx(global_params, model_rate)
+        param_idx = self.compute_param_idx(
+            global_params,
+            model_rate,
+            num_preserved_tail_layers=num_preserved_tail_layers,
+        )
         self.client_param_idx[client_id] = param_idx
 
         sub_params = []
@@ -203,6 +224,7 @@ class HeteroFLAggregator:
         results: list[tuple[str, list[np.ndarray], int]],
         global_params: list[np.ndarray],
         client_label_splits: dict[str, list[int]] | None = None,
+        num_preserved_tail_layers: int = 1,
     ) -> Parameters:
         """
         HeteroFL aggregation with count-based averaging.
@@ -218,11 +240,15 @@ class HeteroFLAggregator:
             global_params: Current global parameters
             client_label_splits: Optional {client_id: [label_indices]} for
                 output layer label-split aggregation (Non-IID support)
+            num_preserved_tail_layers: Number of tail 2D layers preserved
+                during distribute. Must match the value used in distribute().
         """
         if not results:
             return ndarrays_to_parameters(global_params)
 
-        output_layer_indices = self._find_output_layer_indices(global_params)
+        output_layer_indices = self._find_output_layer_indices(
+            global_params, num_preserved_tail_layers
+        )
 
         accumulated = [np.zeros_like(p) for p in global_params]
         count = [np.zeros_like(p) for p in global_params]
