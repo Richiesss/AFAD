@@ -121,22 +121,28 @@ class HeteroFLAggregator:
                 param_idx.append((idx,))
 
             elif len(shape) == 2:
+                expected_in = int(np.ceil(shape[1] * scaler))
                 if is_output_layer:
-                    # Output weight: full output dim, scaled input dim
+                    # Preserved tail layer (bottleneck or classifier):
+                    # output dim is kept full; input follows the previous layer
+                    # exactly (including preserved bottleneck output).
                     output_idx = np.arange(shape[0])
                     if prev_output_idx is not None:
                         input_idx = prev_output_idx
                     else:
-                        input_size = int(np.ceil(shape[1] * scaler))
-                        input_idx = np.arange(input_size)
+                        input_idx = np.arange(expected_in)
                 else:
                     output_size = int(np.ceil(shape[0] * scaler))
                     output_idx = np.arange(output_size)
-                    if prev_output_idx is not None:
+                    if (
+                        prev_output_idx is not None
+                        and len(prev_output_idx) == expected_in
+                    ):
                         input_idx = prev_output_idx
                     else:
-                        input_size = int(np.ceil(shape[1] * scaler))
-                        input_idx = np.arange(input_size)
+                        # Residual/shortcut: input comes from a different branch,
+                        # so prev_output_idx size may not match. Recompute directly.
+                        input_idx = np.arange(expected_in)
 
                 param_idx.append((output_idx, input_idx))
                 prev_output_idx = output_idx
@@ -154,12 +160,14 @@ class HeteroFLAggregator:
             elif len(shape) == 4:
                 output_size = int(np.ceil(shape[0] * scaler))
                 output_idx = np.arange(output_size)
+                expected_in = int(np.ceil(shape[1] * scaler))
 
-                if prev_output_idx is not None:
+                if prev_output_idx is not None and len(prev_output_idx) == expected_in:
                     input_idx = prev_output_idx
                 else:
-                    input_size = int(np.ceil(shape[1] * scaler))
-                    input_idx = np.arange(input_size)
+                    # Residual/shortcut: input comes from a different branch,
+                    # so prev_output_idx size may not match. Recompute directly.
+                    input_idx = np.arange(expected_in)
 
                 param_idx.append((output_idx, input_idx))
                 prev_output_idx = output_idx
