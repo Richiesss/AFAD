@@ -47,6 +47,7 @@ SEED = 42
 LATENT_DIM = 32
 NUM_CLASSES = 10
 FEDGEN_WARMUP_ROUNDS = 1
+AFAD_KD_WARMUP_ROUNDS = 5  # Delay AFAD KD until generator has converged
 LR_BASE = 0.01
 MAX_SAMPLES = 5000
 
@@ -98,6 +99,7 @@ def _default_cfg() -> dict:
         "num_classes": NUM_CLASSES,
         "latent_dim": LATENT_DIM,
         "fedgen_warmup_rounds": FEDGEN_WARMUP_ROUNDS,
+        "afad_kd_warmup_rounds": AFAD_KD_WARMUP_ROUNDS,
         "lr_base": LR_BASE,
         "cid_to_model": dict(CID_TO_MODEL),
         "cid_to_family": dict(CID_TO_FAMILY),
@@ -209,6 +211,7 @@ def run_experiment(
     num_classes = resolved["num_classes"]
     latent_dim = resolved["latent_dim"]
     fedgen_warmup_rounds = resolved["fedgen_warmup_rounds"]
+    afad_kd_warmup_rounds = resolved.get("afad_kd_warmup_rounds", AFAD_KD_WARMUP_ROUNDS)
     lr_base = resolved["lr_base"]
     cid_to_model: dict = resolved["cid_to_model"]
     cid_to_family: dict = resolved["cid_to_family"]
@@ -314,7 +317,11 @@ def run_experiment(
                 "local_epochs": local_epochs,
                 "fedprox_mu": 0.0,
                 "model_rate": model_rate,
-                "regularization": use_regularization and (model_rate >= 1.0),
+                "regularization": (
+                    use_regularization and (round_num > afad_kd_warmup_rounds)
+                    if (enable_heterofl and enable_fedgen)
+                    else use_regularization
+                ),
                 "use_local_init": (round_num == 1 and len(sub_params) == 0),
             }
             if gen_params_bytes is not None:
@@ -323,6 +330,9 @@ def run_experiment(
             train_loader = train_loaders[int(cid) % len(train_loaders)]
 
             if enable_heterofl and enable_fedgen:
+                # Rate-dependent KD: sub-rate clients benefit more from KD guidance
+                # alpha = 0.5 / rate: rate=1.0→0.5, rate=0.5→1.0, rate=0.25→2.0
+                kd_scale = 0.5 / model_rate
                 client = AFADClient(
                     cid=cid,
                     model=model,
@@ -334,6 +344,8 @@ def run_experiment(
                     model_rate=model_rate,
                     model_name=model_name,
                     num_classes=num_classes,
+                    generative_alpha=kd_scale,
+                    generative_beta=kd_scale,
                 )
             elif enable_fedgen:
                 client = FedGenClient(
