@@ -314,7 +314,7 @@ def run_experiment(
                 "local_epochs": local_epochs,
                 "fedprox_mu": 0.0,
                 "model_rate": model_rate,
-                "regularization": use_regularization and (model_rate >= 1.0),
+                "regularization": use_regularization,
                 "use_local_init": (round_num == 1 and len(sub_params) == 0),
             }
             if gen_params_bytes is not None:
