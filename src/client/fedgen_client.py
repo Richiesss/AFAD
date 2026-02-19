@@ -65,11 +65,13 @@ class FedGenClient(fl.client.NumPyClient):
         epochs: int = 20,
         device: str = "cpu",
         lr: float = 0.01,
+        momentum: float = 0.9,
         weight_decay: float = 1e-2,
         generative_alpha: float = DEFAULT_GENERATIVE_ALPHA,
         generative_beta: float = DEFAULT_GENERATIVE_BETA,
         gen_batch_size: int = 32,
         num_classes: int = 10,
+        family: str = "default",
     ):
         self.cid = cid
         self.model = model
@@ -78,7 +80,9 @@ class FedGenClient(fl.client.NumPyClient):
         self.epochs = epochs
         self.device = torch.device(device)
         self.lr = lr
+        self.momentum = momentum
         self.weight_decay = weight_decay
+        self.family = family
         self.generative_alpha = generative_alpha
         self.generative_beta = generative_beta
         self.gen_batch_size = gen_batch_size
@@ -130,6 +134,16 @@ class FedGenClient(fl.client.NumPyClient):
         if parameters and len(parameters) > 0:
             self.set_parameters(parameters)
 
+        # Propagate training config from server (mirrors AFADClient behaviour)
+        if "lr" in config:
+            self.lr = config["lr"]
+        if "momentum" in config:
+            self.momentum = config["momentum"]
+        if "weight_decay" in config:
+            self.weight_decay = config["weight_decay"]
+        if "local_epochs" in config:
+            self.epochs = config["local_epochs"]
+
         glob_iter = config.get("round", 0)
         regularization = config.get("regularization", glob_iter > 0)
 
@@ -138,7 +152,7 @@ class FedGenClient(fl.client.NumPyClient):
         if isinstance(gen_params_bytes, bytes):
             import pickle
 
-            gen_params = pickle.loads(gen_params_bytes)
+            gen_params = pickle.loads(gen_params_bytes)  # noqa: S301
             self.set_generator_parameters(gen_params)
 
         self._train(glob_iter=glob_iter, regularization=regularization)
@@ -150,6 +164,7 @@ class FedGenClient(fl.client.NumPyClient):
             len(self.train_loader.dataset),
             {
                 "client_id": self.cid,
+                "family": getattr(self, "family", "default"),
                 "label_counts": label_counts_str,
             },
         )
@@ -168,6 +183,7 @@ class FedGenClient(fl.client.NumPyClient):
         optimizer = torch.optim.SGD(
             self.model.parameters(),
             lr=self.lr,
+            momentum=self.momentum,
             weight_decay=self.weight_decay,
         )
         self.model.train()

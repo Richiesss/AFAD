@@ -23,6 +23,51 @@ logger = setup_logger("AFADGeneratorTrainer")
 MIN_SAMPLES_PER_LABEL = 1
 
 
+class EMATracker:
+    """Exponential Moving Average tracker for model parameters.
+
+    Maintains a shadow copy of parameters updated as:
+        shadow = decay * shadow + (1 - decay) * current
+
+    The EMA version is smoother and produces more stable generator outputs,
+    which is beneficial when distributing to clients across rounds.
+
+    Args:
+        model: Model whose parameters to track.
+        decay: EMA decay rate. Higher values = slower update, more stable.
+            Typical range: 0.99 - 0.9999. Default 0.999.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().detach()
+
+    def update(self, model: nn.Module) -> None:
+        """Update shadow parameters with current model parameters."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data, alpha=1.0 - self.decay
+                )
+
+    def get_state_dict(self, model: nn.Module) -> dict[str, torch.Tensor]:
+        """Build a state dict using EMA weights for tracked params.
+
+        Starts from model.state_dict() to preserve parameter ordering,
+        then replaces tracked parameter values with their EMA shadows.
+        Non-parameter buffers (e.g. BatchNorm running stats) are left
+        unchanged since they are not tracked by EMA.
+        """
+        sd = model.state_dict()  # OrderedDict — preserves canonical order
+        for name in sd:
+            if name in self.shadow:
+                sd[name] = self.shadow[name].clone()
+        return sd
+
+
 class AFADGeneratorTrainer:
     """Server-side FedGen generator training for AFAD.
 
@@ -31,6 +76,9 @@ class AFADGeneratorTrainer:
     so its latent outputs produce correct predictions via each family
     model's classifier (forward_from_latent).
 
+    An optional EMA tracker smooths the generator parameters over rounds,
+    producing more stable latent representations for client-side KD.
+
     Args:
         generator: FedGenGenerator instance.
         gen_lr: Generator learning rate.
@@ -38,6 +86,7 @@ class AFADGeneratorTrainer:
         ensemble_alpha: Teacher loss weight.
         ensemble_eta: Diversity loss weight.
         device: Training device.
+        ema_decay: EMA decay rate for generator parameters (0.0 = disabled).
     """
 
     def __init__(
@@ -48,14 +97,29 @@ class AFADGeneratorTrainer:
         ensemble_alpha: float = 1.0,
         ensemble_eta: float = 1.0,
         device: str = "cpu",
+        ema_decay: float = 0.999,
     ):
         self.generator = generator
         self.batch_size = batch_size
         self.ensemble_alpha = ensemble_alpha
         self.ensemble_eta = ensemble_eta
         self.device = device
+        self.ema_decay = ema_decay
         self.generator.to(device)
         self.gen_optimizer = torch.optim.Adam(self.generator.parameters(), lr=gen_lr)
+        self.ema_tracker = (
+            EMATracker(generator, decay=ema_decay) if ema_decay > 0 else None
+        )
+
+    def get_inference_state_dict(self) -> dict[str, torch.Tensor]:
+        """Return generator state dict for client distribution.
+
+        When EMA is enabled, returns EMA-smoothed weights (more stable).
+        Otherwise returns the current training weights.
+        """
+        if self.ema_tracker is not None:
+            return self.ema_tracker.get_state_dict(self.generator)
+        return self.generator.state_dict()
 
     @staticmethod
     def get_label_weights(
@@ -107,6 +171,10 @@ class AFADGeneratorTrainer:
         where:
         - L_teacher: Weighted CE of classifier(G(y)) across all families
         - L_diversity: Prevents mode collapse in generator
+
+        After each optimizer step, the EMA tracker is updated. The EMA
+        weights are exposed via get_inference_state_dict() for distribution
+        to clients, providing smoother latent representations.
 
         Args:
             models: Dict mapping family name to FedGenModelWrapper.
@@ -179,6 +247,10 @@ class AFADGeneratorTrainer:
 
                 loss.backward()
                 self.gen_optimizer.step()
+
+                # Update EMA after each optimizer step
+                if self.ema_tracker is not None:
+                    self.ema_tracker.update(self.generator)
 
                 total_loss += loss.item()
                 total_steps += 1
