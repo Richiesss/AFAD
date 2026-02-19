@@ -330,6 +330,9 @@ def run_experiment(
             train_loader = train_loaders[int(cid) % len(train_loaders)]
 
             if enable_heterofl and enable_fedgen:
+                # Rate-dependent KD: sub-rate clients benefit more from KD guidance
+                # alpha = 0.5 / rate: rate=1.0→0.5, rate=0.5→1.0, rate=0.25→2.0
+                kd_scale = 0.5 / model_rate
                 client = AFADClient(
                     cid=cid,
                     model=model,
@@ -341,8 +344,8 @@ def run_experiment(
                     model_rate=model_rate,
                     model_name=model_name,
                     num_classes=num_classes,
-                    generative_alpha=1.0,
-                    generative_beta=1.0,
+                    generative_alpha=kd_scale,
+                    generative_beta=kd_scale,
                 )
             elif enable_fedgen:
                 client = FedGenClient(
