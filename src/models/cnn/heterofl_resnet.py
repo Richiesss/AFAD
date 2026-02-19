@@ -5,8 +5,13 @@ Supports model_rate-based channel width scaling:
   rate=0.5  -> channels [32,  64, 128, 256]  (~2.8M params)
   rate=0.25 -> channels [16,  32,  64, 128]  (~0.7M params)
 
-A Scaler module is inserted after each residual block to compensate
-for the reduced channel count: output = output / model_rate.
+Uses Static BatchNorm (sBN, track_running_stats=False) as per the paper.
+With sBN, BN always uses current-batch statistics at both train and eval time,
+avoiding the running-stats mismatch that occurs after FedAvg aggregation of
+models trained at different width rates.
+
+A single Scaler module is applied once after all residual layers to
+compensate for the reduced channel count: output = output / model_rate.
 """
 
 import torch.nn as nn
@@ -18,7 +23,7 @@ BASE_CHANNELS = [64, 128, 256, 512]
 
 
 class BasicBlock(nn.Module):
-    """Standard ResNet BasicBlock (no bottleneck)."""
+    """Standard ResNet BasicBlock (no bottleneck) with static BN."""
 
     expansion = 1
 
@@ -27,18 +32,18 @@ class BasicBlock(nn.Module):
         self.conv1 = nn.Conv2d(
             in_channels, out_channels, 3, stride=stride, padding=1, bias=False
         )
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels, track_running_stats=False)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(
             out_channels, out_channels, 3, stride=1, padding=1, bias=False
         )
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels, track_running_stats=False)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
+                nn.BatchNorm2d(out_channels, track_running_stats=False),
             )
 
     def forward(self, x):
@@ -50,7 +55,7 @@ class BasicBlock(nn.Module):
 
 
 class HeteroFLResNet(nn.Module):
-    """Width-scalable ResNet18 with HeteroFL Scaler.
+    """Width-scalable ResNet18 with HeteroFL Scaler and static BN.
 
     Args:
         num_classes: Number of output classes.
@@ -74,7 +79,7 @@ class HeteroFLResNet(nn.Module):
         self.conv1 = nn.Conv2d(
             in_channels, channels[0], kernel_size=3, stride=1, padding=1, bias=False
         )
-        self.bn1 = nn.BatchNorm2d(channels[0])
+        self.bn1 = nn.BatchNorm2d(channels[0], track_running_stats=False)
         self.relu = nn.ReLU(inplace=True)
 
         # Residual layers: [2, 2, 2, 2] blocks (ResNet18 config)
@@ -101,10 +106,11 @@ class HeteroFLResNet(nn.Module):
 
     def forward(self, x):
         out = self.relu(self.bn1(self.conv1(x)))
-        out = self.scaler(self.layer1(out))
-        out = self.scaler(self.layer2(out))
-        out = self.scaler(self.layer3(out))
-        out = self.scaler(self.layer4(out))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = self.scaler(out)  # applied once after all layers (paper §3.1)
         out = self.avgpool(out)
         out = out.view(out.size(0), -1)
         out = self.fc(out)

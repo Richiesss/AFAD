@@ -310,7 +310,7 @@ def run_experiment(
                 "family": family,
                 "lr": lr,
                 "momentum": 0.9,
-                "weight_decay": 0.0001,
+                "weight_decay": 0.0005,
                 "local_epochs": local_epochs,
                 "fedprox_mu": 0.0,
                 "model_rate": model_rate,
