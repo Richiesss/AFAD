@@ -334,6 +334,8 @@ def run_experiment(
                     model_rate=model_rate,
                     model_name=model_name,
                     num_classes=num_classes,
+                    generative_alpha=1.0,
+                    generative_beta=1.0,
                 )
             elif enable_fedgen:
                 client = FedGenClient(
