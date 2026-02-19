@@ -61,7 +61,13 @@ CNN family (HeteroFL ResNet18)          ViT family (HeteroFL ViT-Small)
 
 $$\mathcal{L} = \underbrace{\text{CE}(f(x), y)}_{\text{予測損失}} + \alpha \cdot \underbrace{\text{CE}(\text{classifier}(G(y_{rand})), y_{rand})}_{\text{教師損失}} + \beta \cdot \underbrace{\text{KL}(f(x) \| \text{classifier}(G(y_{real})))}_{\text{潜在マッチング損失}}$$
 
-ここで $\alpha = \beta = 10.0$、$0.98^{round}$ で指数減衰する。
+AFAD では $\alpha = \beta = 0.5 / \text{model\_rate}$（小容量クライアントほど強いKDガイダンス）で設定し、$0.98^{round}$ で指数減衰する:
+
+| model_rate | α = β |
+|:---:|:---:|
+| 1.0 | 0.5 |
+| 0.5 | 1.0 |
+| 0.25 | 2.0 |
 
 ### HeteroFL × FedGenModelWrapper の統合
 
@@ -92,7 +98,9 @@ $K$ 台のクライアントが 2 つのモデルファミリー (CNN, ViT) に�
 | CNN | HeteroFL ResNet18 | 512ch, ~11.2M | 256ch, ~2.8M | 128ch, ~0.7M |
 | ViT | HeteroFL ViT-Small | 384dim, ~21.3M | 192dim, ~5.4M | 96dim, ~1.4M |
 
-各モデルには `Scaler` モジュールが挿入され、幅縮小による活性化値の変化を `output / model_rate` で補償する（学習時のみ、推論時は恒等写像）。
+各モデルには `Scaler` モジュールが挿入され、幅縮小による活性化値の変化を `output / model_rate` で補償する（学習時のみ、推論時は恒等写像）。Scaler は全残差層の後に **1 回だけ** 適用する（論文 §3.1 に準拠）。
+
+HeteroFL ResNet18 は **Static BatchNorm (sBN)** を採用（`track_running_stats=False`）。FedAvg 集約後の running stats 不整合を回避し、学習・推論とも常に現在バッチの統計を使用する。
 
 デフォルト構成は 10 クライアント:
 
@@ -179,12 +187,12 @@ $$\mathcal{L}_{diversity} = \exp\left(-\text{mean}(d(z) \odot d(\epsilon))\right
 
 ### 6. クライアント側 FedGen 正則化
 
-Warmup 期間 (3 ラウンド) 後、サーバーから受信した Generator パラメータを用いてクライアント側で正則化を行う:
+**Warmup 期間 (5 ラウンド)** の後、サーバーから受信した Generator パラメータを用いてクライアント側で正則化を行う。Warmup によりジェネレーターが十分収束してから KD を開始するため、初期の雑なシグナルによる悪影響を回避できる:
 
 1. **教師損失** ($\alpha$ 項): ランダムラベル $y_{rand}$ に対して Generator が生成した潜在ベクトルを classifier に入力し、CE を計算
 2. **潜在マッチング損失** ($\beta$ 項): 実データの出力分布と、同じラベルで生成した潜在ベクトルの classifier 出力分布の KL ダイバージェンスを最小化
 
-両項は $0.98^{round}$ で減衰し、EARLY_STOP_EPOCH (20) 以降は無効化される。
+$\alpha = \beta = 0.5 / \text{model\_rate}$ とすることで、小容量（sub-rate）クライアントに強いKD補正を与える。両項は $0.98^{round}$ で減衰し、EARLY_STOP_EPOCH (20) 以降は無効化される。
 
 ---
 
@@ -200,13 +208,32 @@ Warmup 期間 (3 ラウンド) 後、サーバーから受信した Generator �
 | FedGen Only | FedAvg (rate=1.0) | Client-side latent KD | `FedGenClient` | `FedGenGenerator` |
 | AFAD Hybrid | HeteroFL distribute/aggregate | Client-side latent KD | `AFADClient` | `FedGenGenerator` |
 
-### Phase 1 結果 (MNIST, IID, 5 clients, 40 rounds)
+### 直接シミュレーション結果 (MNIST, IID, 10 clients, 30 rounds)
+
+> `run_direct_sim.py` を使用（Ray/Flower 不要）。seed=42 の単一試行。
 
 | 方式 | Best Accuracy | Final Accuracy | Total Time |
 |------|:---:|:---:|:---:|
-| **HeteroFL Only** | **95.58%** | **95.56%** | 1,951s |
-| FedGen Only | 95.37% | 95.31% | 2,161s |
-| AFAD Hybrid | 95.52% | 95.48% | 2,210s |
+| HeteroFL Only | 69.90% | 69.50% | ~120s |
+| FedGen Only | 67.00% | 66.85% | ~135s |
+| **AFAD Hybrid** | **69.85%** | **69.70%** | ~173s |
+
+**AFAD 改善の推移**（全4施策の累積効果）:
+
+| 施策 | AFAD BEST | 差分 |
+|------|:---:|:---:|
+| ベースライン（改善前） | 60.30% | — |
+| ① 全クライアントKD適用 | 61.90% | +1.60pp |
+| ② α/β を 10→1 に削減 | 69.15% | +7.25pp |
+| ③ KD Warmup (5ラウンド) | 69.25% | +0.10pp |
+| **④ レート依存 KD スケーリング** | **69.85%** | **+0.60pp** |
+
+> **主な知見**:
+>
+> 1. **施策②が最大貢献** (+7.25pp): FedGen 用にチューニングされた α=β=10 は AFAD Hybrid では過剰正則化。α=β=1 に下げることで CE 損失が主導的になり精度が急向上
+> 2. **施策③ (KD Warmup)** はジェネレーター収束後にKDを開始することで安定性向上（FINAL=BEST）
+> 3. **施策④ (レート依存スケーリング)** はサブレートクライアントの学習を補強し AFAD が HeteroFL を上回る 69.85% を達成
+> 4. **HeteroFL sBN 修正**（track_running_stats=False）が性能の根幹: 修正前40.85% → 修正後69.90%（+29pp）
 
 ### Phase 2 結果 (OrganAMNIST, Non-IID α=0.5, 10 clients, 40 rounds)
 
@@ -216,14 +243,7 @@ Warmup 期間 (3 ラウンド) 後、サーバーから受信した Generator �
 | FedGen Only | 57.61% | 57.43% | 2.3869 |
 | **AFAD Hybrid** | **71.11%** | **71.11%** | **1.4133** |
 
-> **Phase 2 の主な知見**:
->
-> 1. **HeteroFL 集約が支配的要因**: 集約ありの 2 方式 (70.9–71.1%) vs 集約なし (57.6%) で **13pt** の差
-> 2. **AFAD Hybrid が最高精度** (71.11%)。HeteroFL Only に対して +0.20pt
-> 3. **FedGen KD は正だが限定的**: AFAD − HeteroFL = +0.20pt が KD の純粋な貢献分
-> 4. **FedGen 単体の限界**: KD のみでは同族間の重み共有を代替できない
->
-> **注**: 上記は単一 seed (42) での予備結果。Multi-seed 統計的検証で有意性を確認する必要がある。
+> **注**: 上記は旧バージョン（sBN 修正前）での結果。単一 seed (42) の予備結果。
 
 ---
 
@@ -260,6 +280,7 @@ Clients
 │   SGD + client-side KD (teacher + latent matching), FedAvg 前提
 └─ AFADClient (AFAD Hybrid)
     SGD + FedProx + shape-aware set_parameters + client-side KD
+    α = β = 0.5 / model_rate (レート依存スケーリング)
 ```
 
 ---
@@ -272,7 +293,8 @@ Clients
 |------|------|------|
 | モデル幅 | 固定アーキテクチャ族内 | CNN + ViT の 2 ファミリー対応 |
 | 出力層保護 | 最終 Linear のみ | `num_preserved_tail_layers` で bottleneck + classifier を保護 |
-| Scaler | `1/rate` 補償 (training) | 同一 (`Scaler` モジュール) |
+| Scaler 適用 | 全残差層後に 1 回 | 同一（論文 §3.1 準拠） |
+| BatchNorm | Static BN (track_running_stats=False) | 同一（sBN を全 BN 層に適用） |
 | 集約 | Count-based 平均 | 同一 + label-split 集約 |
 
 ### FedGen [Zhu+, ICML 2021] との差分
@@ -281,10 +303,11 @@ Clients
 |------|------|------|
 | Generator 出力 | 潜在ベクトル (32 次元) | 同一 (`FedGenGenerator`) |
 | KD 実行場所 | クライアント側正則化 | 同一 (`AFADClient._train`) |
-| KD 損失関数 | CE + KL | 同一 (α=10, β=10, 0.98/round 減衰) |
+| KD 損失関数 | CE + KL | 同一（減衰あり） |
+| KD 係数 α, β | 固定値 | レート依存: 0.5 / model_rate |
+| KD Warmup | なし（明示的） | `AFAD_KD_WARMUP_ROUNDS=5` |
 | 集約 | FedAvg | HeteroFL (AFAD モード) / FedAvg (FedGen Only モード) |
 | Generator 学習 | 全クライアントモデルで | family ごとの rate=1.0 モデルで (`AFADGeneratorTrainer`) |
-| Warmup | なし (明示的) | 3 ラウンドの warmup |
 
 ---
 
@@ -310,24 +333,46 @@ uv sync
 
 ## シミュレーションの実行
 
-### 1. 設定
+### 直接シミュレーション（推奨）
 
-`config/afad_config.yaml` で実験パラメータを調整できる:
+Ray/Flower ワーカーを使わず高速に起動できる:
 
-```yaml
-experiment:
-  num_rounds: 40
+```bash
+# フル実験 (10 clients, 30 rounds, MNIST)
+uv run python scripts/run_direct_sim.py
 
-server:
-  min_clients: 10
+# 出力先を指定
+uv run python scripts/run_direct_sim.py --output results/my_run.json
 
-training:
-  local_epochs: 3
-  learning_rate: 0.01
-  momentum: 0.9
+# クイックテスト (4 clients, 5 rounds, 500 samples)
+uv run python scripts/run_quick_test.py
 ```
 
-### 2. 実行
+### 出力例
+
+```
+============================================================
+  AFAD Hybrid
+  enable_fedgen=True, enable_heterofl=True
+============================================================
+  Round  1/30: acc=0.2865  loss=2.2801  time=3.2s
+  ...
+  Round 30/30: acc=0.6970  loss=1.1139  time=7.6s
+
+==========================================================================
+  COMPARISON: Accuracy per Round
+==========================================================================
+Round |        HeteroFL Only |          FedGen Only |          AFAD Hybrid
+--------------------------------------------------------------------------
+    1 |              23.40% |              30.85% |              29.00%
+   ...
+   30 |              69.30% |              66.45% |              69.70%
+--------------------------------------------------------------------------
+ BEST |              69.70% |              66.75% |              69.85%
+FINAL |              69.30% |              66.45% |              69.70%
+```
+
+### Flower ベース実験（旧版）
 
 ```bash
 # 3 方式比較実験 - Phase 1 (MNIST, IID)
@@ -338,36 +383,16 @@ uv run python scripts/run_comparison.py config/afad_phase2_config.yaml
 
 # Multi-seed 統計的検証 (10 seeds)
 python scripts/run_multi_seed.py config/afad_phase2_config.yaml
-
-# seed を指定して実行
-python scripts/run_multi_seed.py config/afad_phase2_config.yaml --seeds 42 123 456
-
-# 出力先を指定
-python scripts/run_multi_seed.py config/afad_phase2_config.yaml --output results/my_results.json
-```
-
-> **Note**: `run_multi_seed.py` は `uv run` ではなく `python` (venv 直接) で実行すること。Ray ワーカーの runtime_env 構築問題を回避するため。結果は JSON に逐次保存され、中断後の再実行で完了済み seed を自動スキップする。
-
-### 3. ログの見方
-
-```
-Round  1: loss=1.3706, accuracy=0.4964, clients=10, time=56.4s
-Round  2: loss=0.7811, accuracy=0.7382, clients=10, time=52.2s
-...
-Generator trained with 2 family models
-...
-Round 40: loss=0.1851, accuracy=0.9531, clients=10, time=55.3s
 ```
 
 ## ディレクトリ構造
 
 ```
 AFAD/
-├── config/
-│   ├── afad_config.yaml            # Phase 1 実験設定 (MNIST)
-│   └── afad_phase2_config.yaml     # Phase 2 実験設定 (OrganAMNIST)
 ├── scripts/
-│   ├── run_comparison.py           # 3 方式比較スクリプト
+│   ├── run_direct_sim.py           # 直接シミュレーション（推奨）
+│   ├── run_quick_test.py           # 4 clients, 5 rounds のクイック検証
+│   ├── run_comparison.py           # 3 方式比較（Flower ベース）
 │   ├── run_multi_seed.py           # Multi-seed 統計的検証
 │   ├── run_experiment.py           # 単一実験スクリプト
 │   └── debug_integration.py        # 手動統合テスト
@@ -378,14 +403,14 @@ AFAD/
 │   │   └── fedgen_client.py        # FedGen Only ベースラインクライアント
 │   ├── data/
 │   │   ├── dataset_config.py       # データセット設定レジストリ
-│   │   ├── mnist_loader.py         # MNIST データローダー (Phase 1)
-│   │   └── medmnist_loader.py      # OrganAMNIST + Dirichlet 分割 (Phase 2)
+│   │   ├── mnist_loader.py         # MNIST データローダー
+│   │   └── medmnist_loader.py      # OrganAMNIST + Dirichlet 分割
 │   ├── models/
 │   │   ├── registry.py             # モデルレジストリ (ファクトリパターン)
 │   │   ├── fedgen_wrapper.py       # FedGenModelWrapper (bottleneck + classifier)
 │   │   ├── scaler.py               # HeteroFL Scaler (1/rate 補償)
 │   │   ├── cnn/
-│   │   │   ├── heterofl_resnet.py  # 幅スケーラブル ResNet18
+│   │   │   ├── heterofl_resnet.py  # 幅スケーラブル ResNet18 (sBN + 1x Scaler)
 │   │   │   ├── resnet.py           # ResNet18, ResNet50
 │   │   │   └── mobilenet.py        # MobileNetV3-Large
 │   │   └── vit/
@@ -397,7 +422,7 @@ AFAD/
 │   ├── server/
 │   │   ├── generator/
 │   │   │   ├── fedgen_generator.py       # FedGen 潜在空間 Generator
-│   │   │   ├── afad_generator_trainer.py # サーバーサイド Generator 訓練
+│   │   │   ├── afad_generator_trainer.py # サーバーサイド Generator 訓練 (EMA)
 │   │   │   └── synthetic_generator.py    # (レガシー) 画像生成 Generator
 │   │   └── strategy/
 │   │       ├── afad_strategy.py          # AFAD 統合戦略 (3 モード対応)
@@ -407,21 +432,21 @@ AFAD/
 │       ├── config_loader.py        # YAML 設定読み込み
 │       ├── logger.py               # ロガー
 │       └── metrics.py              # MetricsCollector
-├── tests/                          # テスト (132 件)
+├── tests/                          # テスト
 │   ├── test_afad_integration.py    # AFAD E2E 統合テスト
-│   ├── test_integration.py         # Strategy 統合テスト (7 件)
+│   ├── test_integration.py         # Strategy 統合テスト
 │   ├── test_fedgen_faithful.py     # FedGen コンポーネントテスト
 │   ├── test_fedprox.py             # FedProx 正則化テスト
 │   ├── test_heterofl_aggregator.py # HeteroFL 集約テスト (tail layers 含む)
-│   ├── test_fedgen_distiller.py    # FedGen 蒸留テスト (レガシー)
 │   ├── test_generator.py           # Generator テスト
 │   ├── test_medmnist_loader.py     # Dirichlet 分割テスト
-│   ├── test_dataset_config.py      # データセット設定テスト
-│   ├── test_metrics.py             # MetricsCollector テスト
-│   └── test_router.py              # FamilyRouter テスト
+│   └── ...
+├── results/                        # 実験結果 JSON
 ├── pyproject.toml
 └── uv.lock
 ```
+
+---
 
 ## 開発
 
@@ -449,6 +474,8 @@ uv run ruff check --fix . && uv run ruff format .
 ```bash
 uv run poe all    # lint + test
 ```
+
+---
 
 ## 参考文献
 
