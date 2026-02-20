@@ -99,22 +99,11 @@ class HeteroFLClient(fl.client.NumPyClient):
                     f"Local: {local_shape}, Received: {received_shape}"
                 )
                 new_param = torch.zeros(local_shape)
-                if len(local_shape) == 1:
-                    new_param[: received_shape[0]] = torch.tensor(param)
-                elif len(local_shape) == 2:
-                    new_param[: received_shape[0], : received_shape[1]] = torch.tensor(
-                        param
-                    )
-                elif len(local_shape) == 4:
-                    new_param[: received_shape[0], : received_shape[1], :, :] = (
-                        torch.tensor(param)
-                    )
-                else:
-                    slices = tuple(
-                        slice(0, min(loc, rec))
-                        for loc, rec in zip(local_shape, received_shape)
-                    )
-                    new_param[slices] = torch.tensor(param[slices])
+                slices = tuple(
+                    slice(0, min(loc, rec))
+                    for loc, rec in zip(local_shape, received_shape)
+                )
+                new_param[slices] = torch.tensor(param)[slices]
 
                 state_dict[key] = new_param
 

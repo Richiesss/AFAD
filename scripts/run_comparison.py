@@ -238,6 +238,9 @@ def afad_client_fn_builder(
         )
         train_loader = train_loaders[int(cid) % len(train_loaders)]
 
+        # Rate-dependent KD scaling: sub-rate clients get stronger guidance
+        # alpha = 0.5 / rate: rate=1.0->0.5, rate=0.5->1.0, rate=0.25->2.0
+        kd_scale = 0.5 / model_rate
         return AFADClient(
             cid=cid,
             model=model,
@@ -250,6 +253,8 @@ def afad_client_fn_builder(
             model_rate=model_rate,
             model_name=model_name,
             num_classes=num_classes,
+            generative_alpha=kd_scale,
+            generative_beta=kd_scale,
         ).to_client()
 
     return client_fn
@@ -331,8 +336,8 @@ def _build_strategy(
     training_config = {
         "lr": 0.01,
         "momentum": 0.9,
-        "weight_decay": 0.0001,
-        "local_epochs": 3,
+        "weight_decay": 0.0005,
+        "local_epochs": 1,
         "fedprox_mu": 0.0,
     }
 
@@ -449,6 +454,11 @@ def run_single_experiment(
         config=fl.server.ServerConfig(num_rounds=num_rounds),
         strategy=strategy,
         client_resources=CLIENT_RESOURCES,
+        ray_init_args={
+            "log_to_driver": False,
+            "object_store_memory": 500_000_000,  # 500MB: avoids /dev/shm exhaustion on WSL2
+            "runtime_env": {},  # skip working-dir package upload (prevents startup hang)
+        },
     )
 
     if ray.is_initialized():

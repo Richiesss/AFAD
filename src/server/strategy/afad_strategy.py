@@ -42,7 +42,7 @@ from src.utils.metrics import MetricsCollector
 logger = setup_logger("AFADStrategy")
 
 # FedGen regularization starts after this many warmup rounds.
-FEDGEN_WARMUP_ROUNDS = 3
+FEDGEN_WARMUP_ROUNDS = 5  # KD starts after round 5 (generator convergence warmup)
 
 
 class AFADStrategy(fl.server.strategy.FedAvg):
@@ -455,11 +455,14 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                     if i < self.num_classes:
                         family_label_counts[family][i] += c
 
+        # Build label_counts_list aligned with torch_models order.
+        # Use zeros for families that have no clients (e.g. vit in a cnn-only run).
         label_counts_list = [
-            family_label_counts[f] for f in torch_models if f in family_label_counts
+            family_label_counts.get(f, [0] * self.num_classes) for f in torch_models
         ]
+        has_any_data = any(any(c > 0 for c in counts) for counts in label_counts_list)
 
-        if not label_counts_list:
+        if not has_any_data:
             num_models = len(torch_models)
             label_weights = np.ones((self.num_classes, num_models)) / num_models
             qualified_labels = list(range(self.num_classes))

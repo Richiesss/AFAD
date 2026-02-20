@@ -282,7 +282,7 @@ class HeteroFLAggregator:
                     accumulated[i] += local_param
                     count[i] += 1
                 elif len(idx) == 1:
-                    size = len(idx[0])
+                    size = min(len(idx[0]), local_param.shape[0])
                     if is_output and label_split is not None:
                         # Output bias: only aggregate for client's labels
                         for lbl in label_split:
@@ -290,11 +290,11 @@ class HeteroFLAggregator:
                                 accumulated[i][lbl] += local_param[lbl]
                                 count[i][lbl] += 1
                     else:
-                        accumulated[i][:size] += local_param
+                        accumulated[i][:size] += local_param[:size]
                         count[i][:size] += 1
                 elif len(idx) == 2:
-                    out_size = len(idx[0])
-                    in_size = len(idx[1])
+                    out_size = min(len(idx[0]), local_param.shape[0])
+                    in_size = min(len(idx[1]), local_param.shape[1])
                     if len(global_params[i].shape) == 2:
                         if is_output and label_split is not None:
                             # Output weight: only aggregate rows for client's labels
@@ -305,19 +305,28 @@ class HeteroFLAggregator:
                                     ]
                                     count[i][lbl, :in_size] += 1
                         else:
-                            accumulated[i][:out_size, :in_size] += local_param
+                            accumulated[i][:out_size, :in_size] += local_param[
+                                :out_size, :in_size
+                            ]
                             count[i][:out_size, :in_size] += 1
                     elif len(global_params[i].shape) == 4:
-                        accumulated[i][:out_size, :in_size, :, :] += local_param
+                        accumulated[i][:out_size, :in_size, :, :] += local_param[
+                            :out_size, :in_size, :, :
+                        ]
                         count[i][:out_size, :in_size, :, :] += 1
                     else:
-                        slices = tuple(slice(0, len(ix)) for ix in idx)
-                        accumulated[i][slices] += local_param
+                        slices = tuple(
+                            slice(0, min(len(ix), s))
+                            for ix, s in zip(idx, local_param.shape)
+                        )
+                        accumulated[i][slices] += local_param[slices]
                         count[i][slices] += 1
                 elif len(idx) == 3:
                     # 3D params (ViT pos_embedding, class_token)
-                    s0, s1, s2 = len(idx[0]), len(idx[1]), len(idx[2])
-                    accumulated[i][:s0, :s1, :s2] += local_param
+                    s0 = min(len(idx[0]), local_param.shape[0])
+                    s1 = min(len(idx[1]), local_param.shape[1])
+                    s2 = min(len(idx[2]), local_param.shape[2])
+                    accumulated[i][:s0, :s1, :s2] += local_param[:s0, :s1, :s2]
                     count[i][:s0, :s1, :s2] += 1
 
         new_params = []
