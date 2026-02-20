@@ -116,6 +116,7 @@ def _quick_cfg() -> dict:
         "num_classes": NUM_CLASSES,
         "latent_dim": LATENT_DIM,
         "fedgen_warmup_rounds": 1,
+        "afad_kd_warmup_rounds": 1,  # quick test: KD starts round 2
         "lr_base": LR_BASE,
         "cid_to_model": dict(_QUICK_CID_TO_MODEL),
         "cid_to_family": dict(_QUICK_CID_TO_FAMILY),
