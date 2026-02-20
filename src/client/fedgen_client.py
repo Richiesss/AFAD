@@ -62,6 +62,7 @@ class FedGenClient(fl.client.NumPyClient):
         model: FedGenModelWrapper,
         generator: FedGenGenerator,
         train_loader,
+        val_loader=None,
         epochs: int = 20,
         device: str = "cpu",
         lr: float = 0.01,
@@ -77,6 +78,7 @@ class FedGenClient(fl.client.NumPyClient):
         self.model = model
         self.generator = generator
         self.train_loader = train_loader
+        self.val_loader = val_loader
         self.epochs = epochs
         self.device = torch.device(device)
         self.lr = lr
@@ -135,6 +137,8 @@ class FedGenClient(fl.client.NumPyClient):
             self.set_parameters(parameters)
 
         # Propagate training config from server (mirrors AFADClient behaviour)
+        if "family" in config:
+            self.family = config["family"]
         if "lr" in config:
             self.lr = config["lr"]
         if "momentum" in config:
@@ -260,8 +264,9 @@ class FedGenClient(fl.client.NumPyClient):
         correct = 0
         total = 0
 
+        eval_loader = self.val_loader if self.val_loader is not None else self.train_loader
         with torch.no_grad():
-            for images, labels in self.train_loader:
+            for images, labels in eval_loader:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 outputs = self.model(images)

@@ -181,6 +181,7 @@ def fedgen_client_fn_builder(
         import src.models.vit.heterofl_vit  # noqa: F401
 
         model_name = cid_to_model.get(cid, "heterofl_resnet18")
+        family = cid_to_family.get(cid, "cnn")
         device = get_device()
         base_model = ModelRegistry.create_model(model_name, num_classes=num_classes)
         model = FedGenModelWrapper(
@@ -198,9 +199,11 @@ def fedgen_client_fn_builder(
             model=model,
             generator=generator,
             train_loader=train_loader,
+            val_loader=test_loader,
             epochs=local_epochs,
             device=device,
             num_classes=num_classes,
+            family=family,
         ).to_client()
 
     return client_fn
