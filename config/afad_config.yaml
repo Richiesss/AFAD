@@ -31,27 +31,14 @@ strategy:
     distill_beta: 0.1           # EMA blending: (1-β)*original + β*distilled
     distill_every: 2            # Distill every N rounds after warmup
 
+# 5 clients: heterofl_resnet18 (CNN) x3 + heterofl_vit_small (ViT) x2
+# Rate distribution: 1.0, 0.5, 0.25 for CNN; 1.0, 0.5 for ViT
 clients:
-  - id: "client_0"
-    model: "resnet50"
-    device: "cuda:0"
-    host: "server"              # Ubuntu machine
-  - id: "client_1"
-    model: "mobilenetv3_large"
-    device: "cuda:0"
-    host: "server"
-  - id: "client_2"
-    model: "resnet18"
-    device: "cuda:0"
-    host: "wsl2"                # WSL2 machine
-  - id: "client_3"
-    model: "vit_tiny"
-    device: "cuda:0"
-    host: "wsl2"
-  - id: "client_4"
-    model: "deit_small"
-    device: "cuda:0"
-    host: "wsl2"
+  - {id: "0", model: "heterofl_resnet18", family: "cnn", model_rate: 1.0}
+  - {id: "1", model: "heterofl_resnet18", family: "cnn", model_rate: 0.5}
+  - {id: "2", model: "heterofl_resnet18", family: "cnn", model_rate: 0.25}
+  - {id: "3", model: "heterofl_vit_small", family: "vit", model_rate: 1.0}
+  - {id: "4", model: "heterofl_vit_small", family: "vit", model_rate: 0.5}
 
 data:
   dataset: "mnist"              # Phase1: mnist, Phase2: medmnist

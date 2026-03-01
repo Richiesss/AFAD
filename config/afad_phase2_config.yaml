@@ -30,33 +30,19 @@ strategy:
     distill_beta: 0.1
     distill_every: 2
 
-# 10 clients: 5 architectures x 2 clients each
-# CID 0,1 -> resnet50 (CNN)
-# CID 2,3 -> mobilenetv3_large (CNN)
-# CID 4,5 -> resnet18 (CNN)
-# CID 6,7 -> vit_tiny (ViT)
-# CID 8,9 -> deit_small (ViT)
+# 10 clients: heterofl_resnet18 (CNN) + heterofl_vit_small (ViT)
+# Rate distribution per family: 1.0, 1.0, 0.5, 0.5, 0.25
 clients:
-  - id: "client_0"
-    model: "resnet50"
-  - id: "client_1"
-    model: "resnet50"
-  - id: "client_2"
-    model: "mobilenetv3_large"
-  - id: "client_3"
-    model: "mobilenetv3_large"
-  - id: "client_4"
-    model: "resnet18"
-  - id: "client_5"
-    model: "resnet18"
-  - id: "client_6"
-    model: "vit_tiny"
-  - id: "client_7"
-    model: "vit_tiny"
-  - id: "client_8"
-    model: "deit_small"
-  - id: "client_9"
-    model: "deit_small"
+  - {id: "0", model: "heterofl_resnet18", family: "cnn", model_rate: 1.0}
+  - {id: "1", model: "heterofl_resnet18", family: "cnn", model_rate: 1.0}
+  - {id: "2", model: "heterofl_resnet18", family: "cnn", model_rate: 0.5}
+  - {id: "3", model: "heterofl_resnet18", family: "cnn", model_rate: 0.5}
+  - {id: "4", model: "heterofl_resnet18", family: "cnn", model_rate: 0.25}
+  - {id: "5", model: "heterofl_vit_small", family: "vit", model_rate: 1.0}
+  - {id: "6", model: "heterofl_vit_small", family: "vit", model_rate: 1.0}
+  - {id: "7", model: "heterofl_vit_small", family: "vit", model_rate: 0.5}
+  - {id: "8", model: "heterofl_vit_small", family: "vit", model_rate: 0.5}
+  - {id: "9", model: "heterofl_vit_small", family: "vit", model_rate: 0.25}
 
 data:
   dataset: "organamnist"
@@ -71,7 +57,7 @@ training:
   optimizer: "sgd"
   momentum: 0.9
   weight_decay: 0.0001
-  fedprox_mu: 0.01        # FedProx proximal term coefficient (0 = disabled)
+  fedprox_mu: 0.01        # FedProx proximal term coefficient (validated: helps Non-IID stability)
 
 evaluation:
   metrics: ["accuracy", "f1_score", "communication_cost"]

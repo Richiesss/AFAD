@@ -9,8 +9,11 @@ Usage:
     python scripts/run_comparison.py config/afad_phase2_config.yaml  # Phase 2
 """
 
+import json
 import os
 import sys
+from datetime import datetime
+from pathlib import Path
 
 import flwr as fl
 import numpy as np
@@ -81,6 +84,35 @@ FAMILY_MODEL_NAMES_P3 = {
 }
 
 LATENT_DIM = 32
+
+
+def _parse_clients_from_config(
+    config_dict: dict,
+) -> tuple[dict[str, str], dict[str, str], dict[str, float], dict[str, str]]:
+    """Parse client config from YAML dict into lookup dicts.
+
+    Falls back to Phase 3 hardcoded values if 'clients' section is absent.
+    """
+    clients = config_dict.get("clients", [])
+    if not clients:
+        return CID_TO_MODEL_P3, CID_TO_FAMILY_P3, CID_TO_RATE_P3, FAMILY_MODEL_NAMES_P3
+
+    cid_to_model: dict[str, str] = {}
+    cid_to_family: dict[str, str] = {}
+    cid_to_rate: dict[str, float] = {}
+    family_model_names: dict[str, str] = {}
+
+    for c in clients:
+        cid = str(c["id"]).removeprefix("client_")
+        model = c.get("model", "heterofl_resnet18")
+        family = c.get("family", "cnn")
+        cid_to_model[cid] = model
+        cid_to_family[cid] = family
+        cid_to_rate[cid] = float(c.get("model_rate", 1.0))
+        family_model_names.setdefault(family, model)
+
+    return cid_to_model, cid_to_family, cid_to_rate, family_model_names
+
 
 device_type = "cuda" if torch.cuda.is_available() else "cpu"
 num_gpus = 0.15 if device_type == "cuda" else 0.0
@@ -241,8 +273,12 @@ def afad_client_fn_builder(
         )
         train_loader = train_loaders[int(cid) % len(train_loaders)]
 
-        # Rate-dependent KD scaling: sub-rate clients get stronger guidance
+        # Rate-dependent KD scaling: sub-rate clients get stronger guidance.
         # alpha = 0.5 / rate: rate=1.0->0.5, rate=0.5->1.0, rate=0.25->2.0
+        # Kept conservative: AFAD generator is trained on full-rate classifiers
+        # so higher alpha destabilises training for sub-rate clients (CUDA OOM risk).
+        # Exp C finding: selective KD (rate=1.0 only, alpha=10) showed +0.5% at R26
+        # but alpha=10 caused GPU instability after R26 -> not used in production.
         kd_scale = 0.5 / model_rate
         return AFADClient(
             cid=cid,
@@ -282,9 +318,13 @@ def _build_strategy(
     cid_to_family: dict[str, str],
     cid_to_rate: dict[str, float] | None,
     family_model_names: dict[str, str],
+    training_cfg: dict | None = None,
+    fedgen_cfg: dict | None = None,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
+    training_cfg = training_cfg or {}
+    fedgen_cfg = fedgen_cfg or {}
 
     # Generator (None for HeteroFL Only)
     generator = None
@@ -327,21 +367,21 @@ def _build_strategy(
     )
 
     fedgen_config = {
-        "gen_lr": 3e-4,
-        "batch_size": 128,
-        "ensemble_alpha": 1.0,
-        "ensemble_eta": 1.0,
-        "gen_epochs": 2,
-        "teacher_iters": 25,
+        "gen_lr": fedgen_cfg.get("gen_lr", 3e-4),
+        "batch_size": fedgen_cfg.get("batch_size", 128),
+        "ensemble_alpha": fedgen_cfg.get("ensemble_alpha", 1.0),
+        "ensemble_eta": fedgen_cfg.get("ensemble_eta", 1.0),
+        "gen_epochs": fedgen_cfg.get("gen_epochs", 2),
+        "teacher_iters": fedgen_cfg.get("teacher_iters", 25),
         "device": device,
     }
 
     training_config = {
-        "lr": 0.01,
-        "momentum": 0.9,
-        "weight_decay": 0.0005,
-        "local_epochs": 1,
-        "fedprox_mu": 0.0,
+        "lr": training_cfg.get("learning_rate", 0.01),
+        "momentum": training_cfg.get("momentum", 0.9),
+        "weight_decay": training_cfg.get("weight_decay", 0.0005),
+        "local_epochs": training_cfg.get("local_epochs", 1),
+        "fedprox_mu": training_cfg.get("fedprox_mu", 0.0),
     }
 
     client_model_rates = cid_to_rate if enable_heterofl else None
@@ -388,6 +428,8 @@ def run_single_experiment(
     cid_to_family: dict[str, str] | None = None,
     cid_to_rate: dict[str, float] | None = None,
     family_model_names: dict[str, str] | None = None,
+    training_cfg: dict | None = None,
+    fedgen_cfg: dict | None = None,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -415,6 +457,8 @@ def run_single_experiment(
         cid_to_family=cid_to_family,
         cid_to_rate=cid_to_rate,
         family_model_names=family_model_names,
+        training_cfg=training_cfg,
+        fedgen_cfg=fedgen_cfg,
     )
 
     # Build client_fn based on experiment mode
@@ -460,7 +504,23 @@ def run_single_experiment(
         ray_init_args={
             "log_to_driver": False,
             "object_store_memory": 500_000_000,  # 500MB: avoids /dev/shm exhaustion on WSL2
-            "runtime_env": {},  # skip working-dir package upload (prevents startup hang)
+            # WSL2 fix: package only source code; resolve binary packages via PYTHONPATH.
+            # Without this, Ray copies .so files to /tmp/ray which breaks on WSL2
+            # ("cannot read file data" for numpy/torch shared libs).
+            "runtime_env": {
+                "working_dir": str(Path(__file__).parent.parent),
+                "excludes": [
+                    ".venv/",
+                    ".git/",
+                    "__pycache__/",
+                    "*.pyc",
+                    "data/",
+                    "results/",
+                ],
+                "env_vars": {
+                    "PYTHONPATH": ":".join(p for p in sys.path if p),
+                },
+            },
         },
     )
 
@@ -532,11 +592,47 @@ def print_comparison_table(results: dict[str, list[dict]]) -> None:
         print(f"  {label}: total_time={total_time:.1f}s")
 
 
+def save_results(results: dict, output_path: Path) -> None:
+    """Persist per-round experiment results to JSON."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Results saved to {output_path}")
+
+
 def main():
+    import argparse
+
     from src.utils.config_loader import load_config
 
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config/afad_config.yaml"
-    config_dict = load_config(config_path)
+    parser = argparse.ArgumentParser(description="Compare HeteroFL / FedGen / AFAD")
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default="config/afad_config.yaml",
+        help="Config YAML path (default: config/afad_config.yaml)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output JSON path (default: results/comparison_<timestamp>.json)",
+    )
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default=None,
+        help='Comma-separated methods to run, e.g. "AFAD Hybrid" or "HeteroFL Only,FedGen Only"',
+    )
+    parser.add_argument(
+        "--load",
+        type=str,
+        default=None,
+        help="Load existing results JSON and merge (skips methods already present unless overridden by --methods)",
+    )
+    args = parser.parse_args()
+
+    config_dict = load_config(args.config)
 
     dataset_name = config_dict["data"].get("dataset", "mnist")
     ds_cfg = get_dataset_config(dataset_name)
@@ -546,6 +642,10 @@ def main():
     local_epochs = config_dict.get("training", {}).get("local_epochs", 3)
     batch_size = config_dict["data"].get("batch_size", 64)
     seed = config_dict["experiment"].get("seed", 42)
+
+    cid_to_model, cid_to_family, cid_to_rate, family_model_names = (
+        _parse_clients_from_config(config_dict)
+    )
 
     logger.info(f"Loading {dataset_name} data for {num_clients} clients...")
 
@@ -574,39 +674,52 @@ def main():
         "num_rounds": num_rounds,
         "local_epochs": local_epochs,
         "seed": seed,
-        "cid_to_model": CID_TO_MODEL_P3,
-        "cid_to_family": CID_TO_FAMILY_P3,
-        "cid_to_rate": CID_TO_RATE_P3,
-        "family_model_names": FAMILY_MODEL_NAMES_P3,
+        "cid_to_model": cid_to_model,
+        "cid_to_family": cid_to_family,
+        "cid_to_rate": cid_to_rate,
+        "family_model_names": family_model_names,
+        "training_cfg": config_dict.get("training", {}),
+        "fedgen_cfg": config_dict.get("strategy", {}).get("fedgen", {}),
     }
 
+    # Load existing results if --load specified
     results: dict[str, list[dict]] = {}
+    if args.load:
+        with open(args.load, encoding="utf-8") as f:
+            results = json.load(f)
+        logger.info(f"Loaded existing results from {args.load}: {list(results.keys())}")
 
-    # --- Experiment 1: HeteroFL Only ---
-    results["HeteroFL Only"] = run_single_experiment(
-        label="HeteroFL Only",
-        enable_fedgen=False,
-        enable_heterofl=True,
-        **exp_kwargs,
-    )
+    # Determine which methods to run
+    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid"]
+    if args.methods:
+        methods_to_run = [m.strip() for m in args.methods.split(",")]
+    else:
+        # Run methods not already present in loaded results
+        methods_to_run = [m for m in all_methods if m not in results]
 
-    # --- Experiment 2: FedGen Only ---
-    results["FedGen Only"] = run_single_experiment(
-        label="FedGen Only",
-        enable_fedgen=True,
-        enable_heterofl=False,
-        **exp_kwargs,
-    )
+    method_configs = {
+        "HeteroFL Only": {"enable_fedgen": False, "enable_heterofl": True},
+        "FedGen Only":   {"enable_fedgen": True,  "enable_heterofl": False},
+        "AFAD Hybrid":   {"enable_fedgen": True,  "enable_heterofl": True},
+    }
 
-    # --- Experiment 3: AFAD Hybrid ---
-    results["AFAD Hybrid"] = run_single_experiment(
-        label="AFAD Hybrid",
-        enable_fedgen=True,
-        enable_heterofl=True,
-        **exp_kwargs,
-    )
+    for method in methods_to_run:
+        cfg = method_configs[method]
+        results[method] = run_single_experiment(
+            label=method,
+            **cfg,
+            **exp_kwargs,
+        )
 
     print_comparison_table(results)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = (
+        Path(args.output)
+        if args.output
+        else Path(f"results/comparison_{timestamp}.json")
+    )
+    save_results(results, output_path)
 
 
 if __name__ == "__main__":

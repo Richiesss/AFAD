@@ -1,0 +1,11 @@
+# Exclude heavy directories from Ray working_dir packaging.
+# Ray respects this file unconditionally (unlike .gitignore).
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+data/
+results/
+logs/
+wandb/
