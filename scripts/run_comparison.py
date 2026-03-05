@@ -35,6 +35,7 @@ from src.data.dataset_config import get_dataset_config
 from src.data.mnist_loader import load_mnist_data
 from src.models.fedgen_wrapper import FedGenModelWrapper
 from src.models.registry import ModelRegistry
+from src.server.generator.family_adapter import FamilyAdapter, FamilyAdapterBank
 from src.server.generator.fedgen_generator import FedGenGenerator
 from src.server.strategy.afad_strategy import AFADStrategy
 from src.utils.logger import setup_logger
@@ -299,6 +300,62 @@ def afad_client_fn_builder(
     return client_fn
 
 
+def afad_adapter_client_fn_builder(
+    train_loaders,
+    test_loader,
+    cid_to_model: dict[str, str],
+    cid_to_family: dict[str, str],
+    num_classes: int,
+    local_epochs: int,
+    cid_to_rate: dict[str, float],
+):
+    """Build client_fn for AFAD + Adapter (wrapped + width-scaled + family adapter)."""
+
+    def client_fn(cid: str) -> fl.client.Client:
+        import src.models.cnn.heterofl_resnet  # noqa: F401
+        import src.models.vit.heterofl_vit  # noqa: F401
+
+        model_name = cid_to_model.get(cid, "heterofl_resnet18")
+        family = cid_to_family.get(cid, "cnn")
+        model_rate = cid_to_rate.get(cid, 1.0)
+        device = get_device()
+        base_model = ModelRegistry.create_model(
+            model_name, num_classes=num_classes, model_rate=model_rate
+        )
+        model = FedGenModelWrapper(
+            base_model, latent_dim=LATENT_DIM, num_classes=num_classes
+        )
+        generator = FedGenGenerator(
+            noise_dim=LATENT_DIM,
+            num_classes=num_classes,
+            latent_dim=LATENT_DIM,
+        )
+        # Client-side adapter: same architecture as server-side; params synced each round
+        adapter = FamilyAdapter(latent_dim=LATENT_DIM)
+
+        train_loader = train_loaders[int(cid) % len(train_loaders)]
+
+        kd_scale = 0.5 / model_rate
+        return AFADClient(
+            cid=cid,
+            model=model,
+            generator=generator,
+            train_loader=train_loader,
+            val_loader=test_loader,
+            epochs=local_epochs,
+            device=device,
+            family=family,
+            model_rate=model_rate,
+            model_name=model_name,
+            num_classes=num_classes,
+            generative_alpha=kd_scale,
+            generative_beta=kd_scale,
+            family_adapter=adapter,
+        ).to_client()
+
+    return client_fn
+
+
 def evaluate_metrics_aggregation_fn(
     eval_metrics: list[tuple[int, dict]],
 ) -> dict:
@@ -320,6 +377,7 @@ def _build_strategy(
     family_model_names: dict[str, str],
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
+    use_adapters: bool = False,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
@@ -386,6 +444,16 @@ def _build_strategy(
 
     client_model_rates = cid_to_rate if enable_heterofl else None
 
+    # Build adapter bank when requested (AFAD + Adapter mode)
+    adapter_bank = None
+    if use_adapters and enable_fedgen:
+        families = list(family_model_names.keys())
+        adapter_bank = FamilyAdapterBank(
+            families=families,
+            latent_dim=LATENT_DIM,
+            device=device,
+        )
+
     strategy = AFADStrategy(
         initial_parameters=initial_params,
         generator=generator,
@@ -398,6 +466,7 @@ def _build_strategy(
         enable_heterofl=enable_heterofl,
         num_rounds=num_rounds,
         num_classes=num_classes,
+        family_adapter_bank=adapter_bank,
         min_fit_clients=num_clients,
         min_available_clients=num_clients,
         fraction_fit=1.0,
@@ -430,6 +499,7 @@ def run_single_experiment(
     family_model_names: dict[str, str] | None = None,
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
+    use_adapters: bool = False,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -459,10 +529,22 @@ def run_single_experiment(
         family_model_names=family_model_names,
         training_cfg=training_cfg,
         fedgen_cfg=fedgen_cfg,
+        use_adapters=use_adapters,
     )
 
     # Build client_fn based on experiment mode
-    if enable_heterofl and enable_fedgen:
+    if enable_heterofl and enable_fedgen and use_adapters:
+        # AFAD + Adapter
+        client_fn = afad_adapter_client_fn_builder(
+            train_loaders,
+            test_loader,
+            cid_to_model,
+            cid_to_family,
+            num_classes,
+            local_epochs,
+            cid_to_rate,
+        )
+    elif enable_heterofl and enable_fedgen:
         # AFAD Hybrid
         client_fn = afad_client_fn_builder(
             train_loaders,
@@ -690,7 +772,7 @@ def main():
         logger.info(f"Loaded existing results from {args.load}: {list(results.keys())}")
 
     # Determine which methods to run
-    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid"]
+    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Adapter"]
     if args.methods:
         methods_to_run = [m.strip() for m in args.methods.split(",")]
     else:
@@ -698,9 +780,10 @@ def main():
         methods_to_run = [m for m in all_methods if m not in results]
 
     method_configs = {
-        "HeteroFL Only": {"enable_fedgen": False, "enable_heterofl": True},
-        "FedGen Only":   {"enable_fedgen": True,  "enable_heterofl": False},
-        "AFAD Hybrid":   {"enable_fedgen": True,  "enable_heterofl": True},
+        "HeteroFL Only":  {"enable_fedgen": False, "enable_heterofl": True,  "use_adapters": False},
+        "FedGen Only":    {"enable_fedgen": True,  "enable_heterofl": False, "use_adapters": False},
+        "AFAD Hybrid":    {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False},
+        "AFAD + Adapter": {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": True},
     }
 
     for method in methods_to_run:

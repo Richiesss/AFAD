@@ -150,29 +150,96 @@ AFAD は HeteroFL と FedGen の中間に位置し、単独では達成できな
 
 ### Phase 2: OrganAMNIST（Non-IID α=0.5, 10 clients, 40 rounds）
 
-> Dirichlet 分割によるデータ不均質環境。
+> Dirichlet 分割によるデータ不均質環境。seed=42 の単一試行。
 
-| 手法 | BEST | FINAL | Loss |
-|------|:----:|:-----:|:----:|
-| HeteroFL Only | 70.91% | 70.78% | 1.4937 |
-| FedGen Only | 57.61% | 57.43% | 2.3869 |
-| **AFAD Hybrid** | **71.11%** | **71.11%** | **1.4133** |
+| 手法 | BEST |
+|------|:----:|
+| HeteroFL Only | 65.36% |
+| **AFAD Hybrid** | **67.08%** |
+| FedGen Only | 84.66% |
 
-Non-IID 環境で FedGen Only は大幅に精度が低下（−13.30pp 対 HeteroFL）するが、AFAD は Generator のクラスバランスが取れた潜在ベクトルで Non-IID 耐性を保ちつつ HeteroFL を上回る。
+Non-IID 環境では FedGen Only が最も高い精度（84.66%）を達成する。FedGen Generator がサーバー側でクラスバランスの取れた潜在ベクトルを生成するため、データ不均質の影響を受けにくい。一方 AFAD は HeteroFL を +1.72pp 上回るが、FedGen との差は **17.58pp** 残る。
+
+この差は「構造的な問題」として分析されており、単純なハイパーパラメータ調整（KD 係数の増加など）では解消できないことが実験的に確認されている（詳細は後述のアブレーション実験を参照）。
+
+### アブレーション実験（Phase 2 ベース）
+
+Phase 2 の AFAD vs FedGen ギャップの原因を特定するために実施したアブレーション。
+
+| 実験 | 変更内容 | 結果 | 解釈 |
+|------|---------|------|------|
+| **Exp A** | FedProx 無効化（mu=0 → 0） | −0.23pp（AFAD 比） | FedProx は役立っている（競合せず） |
+| **Exp C** | KD を rate=1.0 クライアントのみに適用、α=10 | +0.32pp（R26 時点）、その後不安定 | KD 係数を増やしても根本解決にならない |
+
+**結論**: AFAD vs FedGen のギャップは構造的問題。Generator が rate=1.0 のフルレートモデルの潜在空間に最適化されているため、rate<1.0 のサブレートクライアントは KD 信号を適切に活用できない。
+
+---
+
+## AFAD + Adapter（Family-aware Latent Adapter）
+
+### 問題の根本原因と解決策
+
+```
+Generator  ──z──→  FamilyAdapter ──z'──→  forward_from_latent()
+(サーバー訓練)      (per-family MLP)       (クライアント分類器)
+                                              ↑
+                                      Sub-rate クライアントでは
+                                      潜在空間の意味論が異なる
+```
+
+**問題**: Generator は `rate=1.0` のフルレートモデルを教師として訓練される。Sub-rate クライアント（rate=0.5/0.25）は幅縮小 bottleneck により異なる潜在表現を学習するため、Generator の潜在ベクトルが直接使用できない。
+
+**解決策**: `FamilyAdapter`（残差 MLP: 32→64→32）を family ごとにサーバーで訓練し、Generator の潜在ベクトルを各 family の潜在空間へ変換してからクライアントに送信する。
+
+### 設計の詳細
+
+```python
+# family_adapter.py
+class FamilyAdapter(nn.Module):
+    def __init__(self, latent_dim=32, hidden_multiplier=2):
+        hidden_dim = latent_dim * hidden_multiplier  # 32 → 64
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),  # 32 → 64
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),  # 64 → 32
+        )
+    def forward(self, z):
+        return self.net(z) + z  # 残差接続（初期状態≈恒等変換）
+```
+
+| 設計項目 | 選択 | 理由 |
+|----------|------|------|
+| **学習方式** | Generator 凍結後に Adapter を別途訓練（Separate） | 勾配干渉を回避；Generatorの安定収束後に写像を学習 |
+| **Adapter 数** | Per-family 2 個（CNN / ViT） | 実装のシンプルさを優先；Per-(family,rate) 6 個は今後の拡張 |
+| **残差接続** | あり | 初期ラウンドで Adapter が恒等変換に近い状態を保つ |
+| **学習率** | Generator と同じ `gen_lr=3e-4` | Separate 訓練のため干渉なし；収束は速い |
+
+### 変更ファイル（既存コードへの影響なし）
+
+| ファイル | 変更内容 |
+|----------|---------|
+| `src/server/generator/family_adapter.py` | **新規追加** — `FamilyAdapter` + `FamilyAdapterBank` |
+| `src/server/generator/afad_generator_trainer.py` | `train_adapters()` メソッド追加 |
+| `src/server/strategy/afad_strategy.py` | `configure_fit()` でアダプタをシリアライズ、`_train_generator_on_server()` でアダプタ訓練 |
+| `src/client/afad_client.py` | `family_adapter` 受信・適用ロジック追加 |
+| `scripts/run_comparison.py` | 第 4 手法 `"AFAD + Adapter"` の追加 |
+
+> **制約**: `fedgen_client.py`, `fedgen_distiller.py`, `heterofl_resnet.py`, `heterofl_vit.py`, `heterofl_aggregator.py`, `heterofl_client.py` は一切変更せず。
 
 ---
 
 ## 各手法の比較
 
-| | HeteroFL Only | FedGen Only | AFAD Hybrid |
-|---|:---:|:---:|:---:|
-| 計算能力の異種性 (rate 可変) | ○ | × | **○** |
-| アーキテクチャ異種性 (CNN ↔ ViT) | × | ○ | **○** |
-| sub-rate クライアントへの知識補完 | × | △ | **○** |
-| Non-IID 耐性 | 中 | 低 | **高** |
-| 集約方式 | count-based | FedAvg | count-based |
-| クライアント損失 | CE のみ | CE + KD (α/β=10 固定) | CE + KD (α/β=0.5/rate) |
-| サーバー Generator | なし | あり | あり |
+| | HeteroFL Only | FedGen Only | AFAD Hybrid | AFAD + Adapter |
+|---|:---:|:---:|:---:|:---:|
+| 計算能力の異種性 (rate 可変) | ○ | × | **○** | **○** |
+| アーキテクチャ異種性 (CNN ↔ ViT) | × | ○ | **○** | **○** |
+| sub-rate クライアントへの知識補完 | × | △ | ○ | **◎** |
+| Non-IID 耐性 | 中 | 高 | 中 | 中〜高 |
+| 集約方式 | count-based | FedAvg | count-based | count-based |
+| クライアント損失 | CE のみ | CE + KD (α/β=10 固定) | CE + KD (α/β=0.5/rate) | CE + KD + Adapter 補正 |
+| サーバー Generator | なし | あり | あり | あり |
+| 潜在空間アダプタ | なし | なし | なし | **あり（per-family）** |
 
 ---
 
@@ -204,6 +271,7 @@ Clients
 ├── FedGenClient   — CE + KD（α=β=10 固定）/ フルレート / FedAvg 前提
 └── AFADClient     — CE + KD（α=β=0.5/rate）/ 幅スケール / HeteroFL 前提
                      shape-aware set_parameters / FedProx 対応
+                     FamilyAdapter オプション対応（adapter_params 受信時に適用）
 ```
 
 ---
@@ -300,8 +368,15 @@ FINAL |              69.50% |              66.85% |              69.70%
 # 3 手法比較（MNIST, IID, 5 clients, 40 rounds）
 uv run python scripts/run_comparison.py
 
+# 4 手法比較（HeteroFL / FedGen / AFAD / AFAD+Adapter）
+uv run python scripts/run_comparison.py --methods "HeteroFL Only" "FedGen Only" "AFAD Hybrid" "AFAD + Adapter"
+
 # Phase 2（OrganAMNIST, Non-IID）
 uv run python scripts/run_comparison.py config/afad_phase2_config.yaml
+
+# 特定手法のみ実行（既存結果を --load でロード）
+uv run python scripts/run_comparison.py config/afad_phase2_config.yaml \
+  --methods "AFAD + Adapter" --load results/existing.json --output results/new.json
 
 # Multi-seed 統計的検証
 uv run python scripts/run_multi_seed.py config/afad_phase2_config.yaml
@@ -343,7 +418,8 @@ AFAD/
 │   ├── server/
 │   │   ├── generator/
 │   │   │   ├── fedgen_generator.py       # FedGen 潜在空間 Generator
-│   │   │   └── afad_generator_trainer.py # サーバーサイド Generator 訓練
+│   │   │   ├── afad_generator_trainer.py # サーバーサイド Generator 訓練
+│   │   │   └── family_adapter.py         # Family-aware 潜在空間アダプタ
 │   │   └── strategy/
 │   │       ├── afad_strategy.py          # AFAD 統合戦略（3 モード対応）
 │   │       └── heterofl_aggregator.py    # HeteroFL 集約（count-based + label-split）

@@ -86,6 +86,7 @@ class AFADClient(fl.client.NumPyClient):
         generative_alpha: float = DEFAULT_GENERATIVE_ALPHA,
         generative_beta: float = DEFAULT_GENERATIVE_BETA,
         gen_batch_size: int = 32,
+        family_adapter: nn.Module | None = None,
     ):
         self.cid = cid
         self.model = model
@@ -96,6 +97,9 @@ class AFADClient(fl.client.NumPyClient):
         self.device = torch.device(device)
         self.model.to(self.device)
         self.generator.to(self.device)
+        self.family_adapter = family_adapter
+        if self.family_adapter is not None:
+            self.family_adapter.to(self.device)
         self.family = family
         self.model_rate = model_rate
         self.model_name = model_name
@@ -175,6 +179,16 @@ class AFADClient(fl.client.NumPyClient):
             state_dict[key] = torch.tensor(param)
         self.generator.load_state_dict(state_dict, strict=False)
 
+    def set_adapter_parameters(self, parameters: list[np.ndarray]) -> None:
+        """Load family adapter params received from the server."""
+        if self.family_adapter is None:
+            return
+        keys = list(self.family_adapter.state_dict().keys())
+        state_dict = OrderedDict(
+            (k, torch.tensor(p)) for k, p in zip(keys, parameters)
+        )
+        self.family_adapter.load_state_dict(state_dict, strict=False)
+
     def fit(
         self, parameters: list[np.ndarray], config: dict
     ) -> tuple[list[np.ndarray], int, dict]:
@@ -206,6 +220,12 @@ class AFADClient(fl.client.NumPyClient):
         if isinstance(gen_params_bytes, bytes):
             gen_params = pickle.loads(gen_params_bytes)  # noqa: S301
             self.set_generator_parameters(gen_params)
+
+        # Update family adapter if params provided in config
+        adapter_params_bytes = config.get("adapter_params", None)
+        if isinstance(adapter_params_bytes, bytes) and self.family_adapter is not None:
+            adapter_params = pickle.loads(adapter_params_bytes)  # noqa: S301
+            self.set_adapter_parameters(adapter_params)
 
         glob_iter = config.get("round", 0)
         regularization = config.get("regularization", glob_iter > 0)
@@ -264,6 +284,8 @@ class AFADClient(fl.client.NumPyClient):
         )
         self.model.train()
         self.generator.eval()
+        if self.family_adapter is not None:
+            self.family_adapter.eval()
 
         for epoch in range(self.epochs):
             for images, labels in self.train_loader:
@@ -299,6 +321,8 @@ class AFADClient(fl.client.NumPyClient):
                     with torch.no_grad():
                         gen_result = self.generator(sampled_y_t)
                         gen_latent = gen_result["output"]
+                        if self.family_adapter is not None:
+                            gen_latent = self.family_adapter(gen_latent)
 
                     gen_logits = self.model.forward_from_latent(gen_latent)
                     gen_logp = F.log_softmax(gen_logits, dim=1)
@@ -310,6 +334,8 @@ class AFADClient(fl.client.NumPyClient):
                     with torch.no_grad():
                         gen_result_same = self.generator(labels)
                         gen_latent_same = gen_result_same["output"]
+                        if self.family_adapter is not None:
+                            gen_latent_same = self.family_adapter(gen_latent_same)
 
                     gen_logits_same = self.model.forward_from_latent(gen_latent_same)
                     target_p = F.softmax(gen_logits_same, dim=1).clone().detach()

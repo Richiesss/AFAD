@@ -34,6 +34,7 @@ from flwr.common import (
 from flwr.server.client_proxy import ClientProxy
 
 from src.server.generator.afad_generator_trainer import AFADGeneratorTrainer
+from src.server.generator.family_adapter import FamilyAdapterBank
 from src.server.generator.fedgen_generator import FedGenGenerator
 from src.server.strategy.heterofl_aggregator import HeteroFLAggregator
 from src.utils.logger import setup_logger
@@ -80,6 +81,9 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         enable_heterofl: bool = True,
         num_rounds: int = 20,
         num_classes: int = 10,
+        family_adapter_bank: FamilyAdapterBank | None = None,
+        adapter_epochs: int = 1,
+        adapter_steps: int = 20,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -133,6 +137,12 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
         # Metrics
         self.metrics_collector = MetricsCollector()
+
+        # Family adapter bank (optional; None = no adapter)
+        self.family_adapter_bank = family_adapter_bank
+        self._adapter_epochs = adapter_epochs
+        self._adapter_steps = adapter_steps
+        self._adapters_trained = False
 
         # Track whether generator has been trained at least once
         self._generator_trained = False
@@ -245,6 +255,14 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         ):
             gen_params_bytes = self._serialize_generator_params()
 
+        # Pre-serialize per-family adapter params (avoids repeated serialization)
+        family_adapter_bytes: dict[str, bytes] = {}
+        if self.family_adapter_bank is not None and self._adapters_trained:
+            for family in self.family_adapter_bank.get_families():
+                family_adapter_bytes[family] = (
+                    self.family_adapter_bank.serialize_family(family)
+                )
+
         new_fit_ins = []
         for client, fit_ins in standard_fit_ins:
             cid = client.cid
@@ -278,6 +296,10 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             # Send generator params to clients (AFAD/FedGen modes)
             if gen_params_bytes is not None:
                 new_config["generator_params"] = gen_params_bytes
+
+            # Send family-specific adapter params if available
+            if family and family in family_adapter_bytes:
+                new_config["adapter_params"] = family_adapter_bytes[family]
 
             # Determine model parameters to send
             if self.enable_heterofl and family and family in self.family_global_models:
@@ -482,6 +504,21 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
         self._generator_trained = True
         logger.info(f"Generator trained with {len(torch_models)} family models")
+
+        # Train per-family adapters after generator update (frozen generator)
+        if self.family_adapter_bank is not None and self.generator_trainer is not None:
+            self.generator_trainer.train_adapters(
+                models=torch_models,
+                adapter_bank=self.family_adapter_bank,
+                label_weights=label_weights,
+                qualified_labels=qualified_labels,
+                num_epochs=self._adapter_epochs,
+                num_steps=self._adapter_steps,
+            )
+            self._adapters_trained = True
+            logger.info(
+                f"Adapters trained for families: {list(self.family_adapter_bank.get_families())}"
+            )
 
     def configure_evaluate(
         self,

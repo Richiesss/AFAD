@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.server.generator.family_adapter import FamilyAdapterBank
 from src.server.generator.fedgen_generator import FedGenGenerator
 from src.utils.logger import setup_logger
 
@@ -100,6 +101,7 @@ class AFADGeneratorTrainer:
         ema_decay: float = 0.999,
     ):
         self.generator = generator
+        self.gen_lr = gen_lr
         self.batch_size = batch_size
         self.ensemble_alpha = ensemble_alpha
         self.ensemble_eta = ensemble_eta
@@ -262,4 +264,113 @@ class AFADGeneratorTrainer:
 
         avg_loss = total_loss / max(total_steps, 1)
         logger.info(f"Generator training done: avg_loss={avg_loss:.4f}")
+        return avg_loss
+
+    def train_adapters(
+        self,
+        models: dict[str, nn.Module],
+        adapter_bank: FamilyAdapterBank,
+        label_weights: np.ndarray,
+        qualified_labels: list[int],
+        num_epochs: int = 1,
+        num_steps: int = 20,
+    ) -> float:
+        """Train per-family adapters to align generator latent with family classifiers.
+
+        Keeps the generator frozen and trains each family's adapter separately,
+        minimising CE( model.forward_from_latent( adapter(G(y)) ), y ).
+
+        Separate training (not joint with generator) avoids conflicting gradients:
+        the generator optimises for a shared latent space, while adapters specialise
+        per family without perturbing the generator.
+
+        Args:
+            models: Dict mapping family name to FedGenModelWrapper (rate=1.0).
+            adapter_bank: Bank of per-family adapters to train.
+            label_weights: [num_classes, num_families] normalised weights.
+            qualified_labels: Labels with sufficient data.
+            num_epochs: Training epochs per call.
+            num_steps: Gradient steps per epoch.
+
+        Returns:
+            Average training loss across all families and steps.
+        """
+        if not models or not adapter_bank.adapters:
+            return 0.0
+
+        model_items = [
+            (family, model)
+            for family, model in models.items()
+            if family in adapter_bank.adapters
+        ]
+        if not model_items:
+            return 0.0
+
+        logger.info(
+            f"Adapter training: {len(model_items)} families, "
+            f"epochs={num_epochs}, steps={num_steps}"
+        )
+
+        # Freeze generator and family models; only adapters learn
+        self.generator.eval()
+        for _, model in model_items:
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad = False
+
+        adapter_bank.train_mode()
+
+        # Per-family Adam optimisers (same lr as generator)
+        family_optimizers = {
+            family: torch.optim.Adam(
+                adapter_bank.adapters[family].parameters(), lr=self.gen_lr
+            )
+            for family, _ in model_items
+        }
+
+        total_loss = 0.0
+        total_steps = 0
+
+        for _epoch in range(num_epochs):
+            for _step in range(num_steps):
+                y = np.random.choice(qualified_labels, self.batch_size)
+                y_input = torch.LongTensor(y).to(self.device)
+
+                # Generate latents once (frozen generator, no grad needed)
+                with torch.no_grad():
+                    gen_result = self.generator(y_input)
+                    gen_output = gen_result["output"]
+
+                for i, (family, model) in enumerate(model_items):
+                    optimizer = family_optimizers[family]
+                    optimizer.zero_grad()
+
+                    # Adapt latent for this family (adapter IS being trained)
+                    adapted = adapter_bank.adapters[family](gen_output.detach())
+
+                    weight = label_weights[y, i]
+                    weight_tensor = torch.tensor(
+                        weight, dtype=torch.float32, device=self.device
+                    )
+
+                    logits = model.forward_from_latent(adapted)
+                    logp = F.log_softmax(logits, dim=1)
+                    per_sample_loss = self.generator.crossentropy_loss(logp, y_input)
+                    loss = torch.mean(per_sample_loss * weight_tensor)
+
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+                    total_steps += 1
+
+        # Re-enable gradients for family models
+        for _, model in model_items:
+            for p in model.parameters():
+                p.requires_grad = True
+
+        adapter_bank.eval_mode()
+
+        avg_loss = total_loss / max(total_steps, 1)
+        logger.info(f"Adapter training done: avg_loss={avg_loss:.4f}")
         return avg_loss
