@@ -34,7 +34,6 @@ from flwr.common import (
 from flwr.server.client_proxy import ClientProxy
 
 from src.server.generator.afad_generator_trainer import AFADGeneratorTrainer
-from src.server.generator.family_adapter import FamilyAdapterBank
 from src.server.generator.fedgen_generator import FedGenGenerator
 from src.server.strategy.heterofl_aggregator import HeteroFLAggregator
 from src.utils.logger import setup_logger
@@ -81,9 +80,6 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         enable_heterofl: bool = True,
         num_rounds: int = 20,
         num_classes: int = 10,
-        family_adapter_bank: FamilyAdapterBank | None = None,
-        adapter_epochs: int = 1,
-        adapter_steps: int = 20,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -138,12 +134,6 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         # Metrics
         self.metrics_collector = MetricsCollector()
 
-        # Family adapter bank (optional; None = no adapter)
-        self.family_adapter_bank = family_adapter_bank
-        self._adapter_epochs = adapter_epochs
-        self._adapter_steps = adapter_steps
-        self._adapters_trained = False
-
         # Track whether generator has been trained at least once
         self._generator_trained = False
 
@@ -189,19 +179,27 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 )
 
     def _reconstruct_model(
-        self, model_name: str, np_params: list[np.ndarray]
+        self, model_name: str, np_params: list[np.ndarray], model_rate: float = 1.0
     ) -> nn.Module | None:
-        """Reconstruct nn.Module from stored numpy arrays."""
+        """Reconstruct nn.Module from stored numpy arrays.
+
+        Args:
+            model_name: Key in model_factories.
+            np_params: Parameter arrays matching the model's state_dict.
+            model_rate: Width scaling rate (1.0 = full, 0.5 = half, etc.).
+        """
         if model_name not in self.model_factories:
             return None
 
-        model = self.model_factories[model_name](num_classes=self.num_classes)
+        model = self.model_factories[model_name](
+            num_classes=self.num_classes, model_rate=model_rate
+        )
         state_dict = model.state_dict()
         keys = list(state_dict.keys())
 
         if len(keys) != len(np_params):
             logger.warning(
-                f"Param count mismatch for {model_name}: "
+                f"Param count mismatch for {model_name} rate={model_rate}: "
                 f"model has {len(keys)}, stored {len(np_params)}"
             )
             return None
@@ -255,14 +253,6 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         ):
             gen_params_bytes = self._serialize_generator_params()
 
-        # Pre-serialize per-family adapter params (avoids repeated serialization)
-        family_adapter_bytes: dict[str, bytes] = {}
-        if self.family_adapter_bank is not None and self._adapters_trained:
-            for family in self.family_adapter_bank.get_families():
-                family_adapter_bytes[family] = (
-                    self.family_adapter_bank.serialize_family(family)
-                )
-
         new_fit_ins = []
         for client, fit_ins in standard_fit_ins:
             cid = client.cid
@@ -296,10 +286,6 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             # Send generator params to clients (AFAD/FedGen modes)
             if gen_params_bytes is not None:
                 new_config["generator_params"] = gen_params_bytes
-
-            # Send family-specific adapter params if available
-            if family and family in family_adapter_bytes:
-                new_config["adapter_params"] = family_adapter_bytes[family]
 
             # Determine model parameters to send
             if self.enable_heterofl and family and family in self.family_global_models:
@@ -446,31 +432,70 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
             logger.info(f"Family {family}: FedAvg aggregated {len(items)} clients")
 
+    def _get_sub_rates(self) -> list[float]:
+        """Return unique sub-rates (< 1.0) used across all clients."""
+        return sorted({r for r in self.client_model_rates.values() if r < 1.0})
+
     def _train_generator_on_server(self, server_round: int) -> None:
-        """Reconstruct FedGenModelWrapper models and train generator."""
+        """Reconstruct FedGenModelWrapper models and train generator.
+
+        Rate-aware training: in addition to full-rate (rate=1.0) family models,
+        also reconstructs sub-rate models so the generator learns latents that
+        are useful across all width variants, closing the structural KD gap.
+        """
         if not self.model_factories:
             logger.warning("No model_factories; skipping generator training")
             return
 
         # Reconstruct full-rate FedGenModelWrapper from family_global_models
         torch_models: dict[str, nn.Module] = {}
+        # Maps model key → family name (for label weight lookup)
+        model_family_map: dict[str, str] = {}
+
         for family, np_params in self.family_global_models.items():
             model_name = self.family_model_names.get(family)
             if not model_name:
                 continue
-            model = self._reconstruct_model(model_name, np_params)
+            model = self._reconstruct_model(model_name, np_params, model_rate=1.0)
             if model is not None:
                 torch_models[family] = model
+                model_family_map[family] = family
 
         if len(torch_models) < 2:
             logger.info("Not enough models for generator training")
             return
 
+        # Rate-aware: also add sub-rate models so G learns cross-rate latents.
+        # Sub-rate params are obtained by distributing the family global params.
+        if self.enable_heterofl:
+            for rate in self._get_sub_rates():
+                for family, np_params in self.family_global_models.items():
+                    model_name = self.family_model_names.get(family)
+                    if not model_name:
+                        continue
+                    sub_params = self.hetero_aggregator.distribute(
+                        np_params,
+                        client_id=f"_gen_{family}_{rate}",
+                        model_rate=rate,
+                        num_preserved_tail_layers=self._num_preserved_tail_layers,
+                    )
+                    model = self._reconstruct_model(model_name, sub_params, model_rate=rate)
+                    if model is not None:
+                        key = f"{family}_r{rate}"
+                        torch_models[key] = model
+                        model_family_map[key] = family
+
+            if len(torch_models) > 2:
+                logger.info(
+                    f"Rate-aware generator training: {len(torch_models)} models "
+                    f"({list(torch_models.keys())})"
+                )
+
         # Compute label weights (aggregate per-client counts to per-family)
         family_label_counts: dict[str, list[int]] = {}
         for cid, counts in self.client_label_counts.items():
             family = self.client_family_map.get(cid)
-            if family and family in torch_models:
+            if family and family in self.family_global_models:
                 if family not in family_label_counts:
                     family_label_counts[family] = [0] * self.num_classes
                 for i, c in enumerate(counts):
@@ -478,9 +503,10 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                         family_label_counts[family][i] += c
 
         # Build label_counts_list aligned with torch_models order.
-        # Use zeros for families that have no clients (e.g. vit in a cnn-only run).
+        # Sub-rate models inherit their parent family's label distribution.
         label_counts_list = [
-            family_label_counts.get(f, [0] * self.num_classes) for f in torch_models
+            family_label_counts.get(model_family_map[k], [0] * self.num_classes)
+            for k in torch_models
         ]
         has_any_data = any(any(c > 0 for c in counts) for counts in label_counts_list)
 
@@ -503,22 +529,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         )
 
         self._generator_trained = True
-        logger.info(f"Generator trained with {len(torch_models)} family models")
-
-        # Train per-family adapters after generator update (frozen generator)
-        if self.family_adapter_bank is not None and self.generator_trainer is not None:
-            self.generator_trainer.train_adapters(
-                models=torch_models,
-                adapter_bank=self.family_adapter_bank,
-                label_weights=label_weights,
-                qualified_labels=qualified_labels,
-                num_epochs=self._adapter_epochs,
-                num_steps=self._adapter_steps,
-            )
-            self._adapters_trained = True
-            logger.info(
-                f"Adapters trained for families: {list(self.family_adapter_bank.get_families())}"
-            )
+        logger.info(f"Generator trained with {len(torch_models)} models")
 
     def configure_evaluate(
         self,

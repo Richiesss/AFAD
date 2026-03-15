@@ -35,7 +35,6 @@ from src.data.dataset_config import get_dataset_config
 from src.data.mnist_loader import load_mnist_data
 from src.models.fedgen_wrapper import FedGenModelWrapper
 from src.models.registry import ModelRegistry
-from src.server.generator.family_adapter import FamilyAdapter, FamilyAdapterBank
 from src.server.generator.fedgen_generator import FedGenGenerator
 from src.server.strategy.afad_strategy import AFADStrategy
 from src.utils.logger import setup_logger
@@ -149,9 +148,9 @@ def build_wrapped_model_factories(
     factories = {}
     for _family, name in family_model_names.items():
         if name not in factories:
-            factories[name] = lambda num_classes=10, _n=name, _ld=latent_dim: (
+            factories[name] = lambda num_classes=10, model_rate=1.0, _n=name, _ld=latent_dim: (
                 FedGenModelWrapper(
-                    ModelRegistry.create_model(_n, num_classes=num_classes),
+                    ModelRegistry.create_model(_n, num_classes=num_classes, model_rate=model_rate),
                     latent_dim=_ld,
                     num_classes=num_classes,
                 )
@@ -250,6 +249,7 @@ def afad_client_fn_builder(
     num_classes: int,
     local_epochs: int,
     cid_to_rate: dict[str, float],
+    proto_gamma: float = 0.0,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -274,12 +274,6 @@ def afad_client_fn_builder(
         )
         train_loader = train_loaders[int(cid) % len(train_loaders)]
 
-        # Rate-dependent KD scaling: sub-rate clients get stronger guidance.
-        # alpha = 0.5 / rate: rate=1.0->0.5, rate=0.5->1.0, rate=0.25->2.0
-        # Kept conservative: AFAD generator is trained on full-rate classifiers
-        # so higher alpha destabilises training for sub-rate clients (CUDA OOM risk).
-        # Exp C finding: selective KD (rate=1.0 only, alpha=10) showed +0.5% at R26
-        # but alpha=10 caused GPU instability after R26 -> not used in production.
         kd_scale = 0.5 / model_rate
         return AFADClient(
             cid=cid,
@@ -295,62 +289,7 @@ def afad_client_fn_builder(
             num_classes=num_classes,
             generative_alpha=kd_scale,
             generative_beta=kd_scale,
-        ).to_client()
-
-    return client_fn
-
-
-def afad_adapter_client_fn_builder(
-    train_loaders,
-    test_loader,
-    cid_to_model: dict[str, str],
-    cid_to_family: dict[str, str],
-    num_classes: int,
-    local_epochs: int,
-    cid_to_rate: dict[str, float],
-):
-    """Build client_fn for AFAD + Adapter (wrapped + width-scaled + family adapter)."""
-
-    def client_fn(cid: str) -> fl.client.Client:
-        import src.models.cnn.heterofl_resnet  # noqa: F401
-        import src.models.vit.heterofl_vit  # noqa: F401
-
-        model_name = cid_to_model.get(cid, "heterofl_resnet18")
-        family = cid_to_family.get(cid, "cnn")
-        model_rate = cid_to_rate.get(cid, 1.0)
-        device = get_device()
-        base_model = ModelRegistry.create_model(
-            model_name, num_classes=num_classes, model_rate=model_rate
-        )
-        model = FedGenModelWrapper(
-            base_model, latent_dim=LATENT_DIM, num_classes=num_classes
-        )
-        generator = FedGenGenerator(
-            noise_dim=LATENT_DIM,
-            num_classes=num_classes,
-            latent_dim=LATENT_DIM,
-        )
-        # Client-side adapter: same architecture as server-side; params synced each round
-        adapter = FamilyAdapter(latent_dim=LATENT_DIM)
-
-        train_loader = train_loaders[int(cid) % len(train_loaders)]
-
-        kd_scale = 0.5 / model_rate
-        return AFADClient(
-            cid=cid,
-            model=model,
-            generator=generator,
-            train_loader=train_loader,
-            val_loader=test_loader,
-            epochs=local_epochs,
-            device=device,
-            family=family,
-            model_rate=model_rate,
-            model_name=model_name,
-            num_classes=num_classes,
-            generative_alpha=kd_scale,
-            generative_beta=kd_scale,
-            family_adapter=adapter,
+            proto_gamma=proto_gamma,
         ).to_client()
 
     return client_fn
@@ -377,7 +316,6 @@ def _build_strategy(
     family_model_names: dict[str, str],
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
-    use_adapters: bool = False,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
@@ -444,16 +382,6 @@ def _build_strategy(
 
     client_model_rates = cid_to_rate if enable_heterofl else None
 
-    # Build adapter bank when requested (AFAD + Adapter mode)
-    adapter_bank = None
-    if use_adapters and enable_fedgen:
-        families = list(family_model_names.keys())
-        adapter_bank = FamilyAdapterBank(
-            families=families,
-            latent_dim=LATENT_DIM,
-            device=device,
-        )
-
     strategy = AFADStrategy(
         initial_parameters=initial_params,
         generator=generator,
@@ -466,7 +394,6 @@ def _build_strategy(
         enable_heterofl=enable_heterofl,
         num_rounds=num_rounds,
         num_classes=num_classes,
-        family_adapter_bank=adapter_bank,
         min_fit_clients=num_clients,
         min_available_clients=num_clients,
         fraction_fit=1.0,
@@ -499,7 +426,7 @@ def run_single_experiment(
     family_model_names: dict[str, str] | None = None,
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
-    use_adapters: bool = False,
+    proto_gamma: float = 0.0,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -529,22 +456,10 @@ def run_single_experiment(
         family_model_names=family_model_names,
         training_cfg=training_cfg,
         fedgen_cfg=fedgen_cfg,
-        use_adapters=use_adapters,
     )
 
     # Build client_fn based on experiment mode
-    if enable_heterofl and enable_fedgen and use_adapters:
-        # AFAD + Adapter
-        client_fn = afad_adapter_client_fn_builder(
-            train_loaders,
-            test_loader,
-            cid_to_model,
-            cid_to_family,
-            num_classes,
-            local_epochs,
-            cid_to_rate,
-        )
-    elif enable_heterofl and enable_fedgen:
+    if enable_heterofl and enable_fedgen:
         # AFAD Hybrid
         client_fn = afad_client_fn_builder(
             train_loaders,
@@ -554,6 +469,7 @@ def run_single_experiment(
             num_classes,
             local_epochs,
             cid_to_rate,
+            proto_gamma=proto_gamma,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -772,7 +688,7 @@ def main():
         logger.info(f"Loaded existing results from {args.load}: {list(results.keys())}")
 
     # Determine which methods to run
-    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Adapter"]
+    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Proto"]
     if args.methods:
         methods_to_run = [m.strip() for m in args.methods.split(",")]
     else:
@@ -780,10 +696,10 @@ def main():
         methods_to_run = [m for m in all_methods if m not in results]
 
     method_configs = {
-        "HeteroFL Only":  {"enable_fedgen": False, "enable_heterofl": True,  "use_adapters": False},
-        "FedGen Only":    {"enable_fedgen": True,  "enable_heterofl": False, "use_adapters": False},
-        "AFAD Hybrid":    {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False},
-        "AFAD + Adapter": {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": True},
+        "HeteroFL Only": {"enable_fedgen": False, "enable_heterofl": True},
+        "FedGen Only":   {"enable_fedgen": True,  "enable_heterofl": False},
+        "AFAD Hybrid":   {"enable_fedgen": True,  "enable_heterofl": True},
+        "AFAD + Proto":  {"enable_fedgen": True,  "enable_heterofl": True,  "proto_gamma": 1.0},
     }
 
     for method in methods_to_run:
