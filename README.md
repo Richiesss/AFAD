@@ -155,10 +155,11 @@ AFAD は HeteroFL と FedGen の中間に位置し、単独では達成できな
 | 手法 | BEST |
 |------|:----:|
 | HeteroFL Only | 65.36% |
-| **AFAD Hybrid** | **67.08%** |
+| AFAD Hybrid | 67.08% |
+| **AFAD + Proto** | **68.00%** |
 | FedGen Only | 84.66% |
 
-Non-IID 環境では FedGen Only が最も高い精度（84.66%）を達成する。FedGen Generator がサーバー側でクラスバランスの取れた潜在ベクトルを生成するため、データ不均質の影響を受けにくい。一方 AFAD は HeteroFL を +1.72pp 上回るが、FedGen との差は **17.58pp** 残る。
+AFAD + Proto はプロトタイプアンカリング（後述）により AFAD Hybrid を **+0.92pp** 上回る。Non-IID 環境では FedGen Only が最も高い精度（84.66%）を達成する。FedGen Generator がサーバー側でクラスバランスの取れた潜在ベクトルを生成するため、データ不均質の影響を受けにくい。一方 AFAD + Proto は HeteroFL を +2.64pp 上回るが、FedGen との差は **16.66pp** 残る。
 
 この差は「構造的な問題」として分析されており、単純なハイパーパラメータ調整（KD 係数の増加など）では解消できないことが実験的に確認されている（詳細は後述のアブレーション実験を参照）。
 
@@ -175,54 +176,46 @@ Phase 2 の AFAD vs FedGen ギャップの原因を特定するために実施�
 
 ---
 
-## AFAD + Adapter（Family-aware Latent Adapter）
+## AFAD + Proto（Rate-aware Generator + Prototype Anchoring）
 
 ### 問題の根本原因と解決策
 
 ```
-Generator  ──z──→  FamilyAdapter ──z'──→  forward_from_latent()
-(サーバー訓練)      (per-family MLP)       (クライアント分類器)
-                                              ↑
-                                      Sub-rate クライアントでは
-                                      潜在空間の意味論が異なる
+Generator（サーバー訓練）
+  ↓ G(y) — 32次元潜在ベクトル
+クライアント
+  ↓ bottleneck(backbone(x)) — sub-rate では異なる潜在空間
+classifier → 予測
 ```
 
-**問題**: Generator は `rate=1.0` のフルレートモデルを教師として訓練される。Sub-rate クライアント（rate=0.5/0.25）は幅縮小 bottleneck により異なる潜在表現を学習するため、Generator の潜在ベクトルが直接使用できない。
+**問題**: Generator は従来 `rate=1.0` のフルレートモデルのみを教師として訓練されていた。Sub-rate クライアント（rate=0.5/0.25）は幅縮小 bottleneck により異なる潜在表現を学習するため、Generator の潜在ベクトルと latent 空間が一致しない。
 
-**解決策**: `FamilyAdapter`（残差 MLP: 32→64→32）を family ごとにサーバーで訓練し、Generator の潜在ベクトルを各 family の潜在空間へ変換してからクライアントに送信する。
+**解決策**: 2 つの改善を組み合わせる。
+
+1. **Rate-aware Generator 訓練**（サーバー側）: 6 モデル（CNN/ViT × rate=1.0/0.5/0.25）全てを教師として Generator を訓練し、sub-rate の潜在空間を反映した潜在ベクトルを生成する。
+
+2. **Prototype Anchoring**（クライアント側）: 追加損失 $\mathcal{L}_{\text{proto}}$ でクライアントの bottleneck 出力を Generator の潜在ベクトルに幾何的に引き寄せる。
+
+$$\mathcal{L}_{\text{proto}} = \gamma \cdot e^{-\lambda \cdot t} \cdot \text{MSE}\bigl(\text{bottleneck}(\text{backbone}(x)),\; G(y)\bigr)$$
+
+$\gamma = 1.0$（proto_gamma）、$\lambda = \text{DECAY\_RATE}^{\text{round}}$ で指数減衰。
 
 ### 設計の詳細
 
-```python
-# family_adapter.py
-class FamilyAdapter(nn.Module):
-    def __init__(self, latent_dim=32, hidden_multiplier=2):
-        hidden_dim = latent_dim * hidden_multiplier  # 32 → 64
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),  # 32 → 64
-            nn.ReLU(),
-            nn.Linear(hidden_dim, latent_dim),  # 64 → 32
-        )
-    def forward(self, z):
-        return self.net(z) + z  # 残差接続（初期状態≈恒等変換）
-```
-
 | 設計項目 | 選択 | 理由 |
 |----------|------|------|
-| **学習方式** | Generator 凍結後に Adapter を別途訓練（Separate） | 勾配干渉を回避；Generatorの安定収束後に写像を学習 |
-| **Adapter 数** | Per-family 2 個（CNN / ViT） | 実装のシンプルさを優先；Per-(family,rate) 6 個は今後の拡張 |
-| **残差接続** | あり | 初期ラウンドで Adapter が恒等変換に近い状態を保つ |
-| **学習率** | Generator と同じ `gen_lr=3e-4` | Separate 訓練のため干渉なし；収束は速い |
+| **Generator 教師** | 6 モデル（CNN/ViT × rate=1.0/0.5/0.25） | sub-rate の潜在空間を Generator に反映 |
+| **アンカリング損失** | MSE（bottleneck 出力 vs G(y)）| 潜在空間の幾何的整合性を直接最適化 |
+| **proto_gamma** | 1.0（指数減衰あり） | 初期ラウンドで強く引き寄せ、収束後は KD に委譲 |
+| **既存コードへの影響** | `afad_client.py`, `afad_strategy.py` のみ変更 | ベースライン手法には一切影響なし |
 
-### 変更ファイル（既存コードへの影響なし）
+### 変更ファイル
 
 | ファイル | 変更内容 |
 |----------|---------|
-| `src/server/generator/family_adapter.py` | **新規追加** — `FamilyAdapter` + `FamilyAdapterBank` |
-| `src/server/generator/afad_generator_trainer.py` | `train_adapters()` メソッド追加 |
-| `src/server/strategy/afad_strategy.py` | `configure_fit()` でアダプタをシリアライズ、`_train_generator_on_server()` でアダプタ訓練 |
-| `src/client/afad_client.py` | `family_adapter` 受信・適用ロジック追加 |
-| `scripts/run_comparison.py` | 第 4 手法 `"AFAD + Adapter"` の追加 |
+| `src/server/strategy/afad_strategy.py` | `_get_sub_rates()` + `_reconstruct_model(model_rate)` — rate-aware Generator 訓練 |
+| `src/client/afad_client.py` | `proto_gamma` パラメータ + Prototype Anchoring 損失 |
+| `scripts/run_comparison.py` | 第 4 手法 `"AFAD + Proto"` の追加（`proto_gamma=1.0`） |
 
 > **制約**: `fedgen_client.py`, `fedgen_distiller.py`, `heterofl_resnet.py`, `heterofl_vit.py`, `heterofl_aggregator.py`, `heterofl_client.py` は一切変更せず。
 
@@ -230,16 +223,16 @@ class FamilyAdapter(nn.Module):
 
 ## 各手法の比較
 
-| | HeteroFL Only | FedGen Only | AFAD Hybrid | AFAD + Adapter |
+| | HeteroFL Only | FedGen Only | AFAD Hybrid | AFAD + Proto |
 |---|:---:|:---:|:---:|:---:|
 | 計算能力の異種性 (rate 可変) | ○ | × | **○** | **○** |
 | アーキテクチャ異種性 (CNN ↔ ViT) | × | ○ | **○** | **○** |
 | sub-rate クライアントへの知識補完 | × | △ | ○ | **◎** |
 | Non-IID 耐性 | 中 | 高 | 中 | 中〜高 |
 | 集約方式 | count-based | FedAvg | count-based | count-based |
-| クライアント損失 | CE のみ | CE + KD (α/β=10 固定) | CE + KD (α/β=0.5/rate) | CE + KD + Adapter 補正 |
-| サーバー Generator | なし | あり | あり | あり |
-| 潜在空間アダプタ | なし | なし | なし | **あり（per-family）** |
+| クライアント損失 | CE のみ | CE + KD (α/β=10 固定) | CE + KD (α/β=0.5/rate) | CE + KD + Proto anchoring |
+| サーバー Generator 訓練対象 | なし | rate=1.0 のみ | rate=1.0 のみ | **rate=1.0/0.5/0.25 全て** |
+| プロトタイプアンカリング | なし | なし | なし | **あり（proto_gamma=1.0）** |
 
 ---
 
@@ -271,7 +264,7 @@ Clients
 ├── FedGenClient   — CE + KD（α=β=10 固定）/ フルレート / FedAvg 前提
 └── AFADClient     — CE + KD（α=β=0.5/rate）/ 幅スケール / HeteroFL 前提
                      shape-aware set_parameters / FedProx 対応
-                     FamilyAdapter オプション対応（adapter_params 受信時に適用）
+                     Prototype Anchoring オプション対応（proto_gamma > 0 時に有効）
 ```
 
 ---
@@ -368,15 +361,15 @@ FINAL |              69.50% |              66.85% |              69.70%
 # 3 手法比較（MNIST, IID, 5 clients, 40 rounds）
 uv run python scripts/run_comparison.py
 
-# 4 手法比較（HeteroFL / FedGen / AFAD / AFAD+Adapter）
-uv run python scripts/run_comparison.py --methods "HeteroFL Only" "FedGen Only" "AFAD Hybrid" "AFAD + Adapter"
+# 4 手法比較（HeteroFL / FedGen / AFAD / AFAD+Proto）
+uv run python scripts/run_comparison.py --methods "HeteroFL Only" "FedGen Only" "AFAD Hybrid" "AFAD + Proto"
 
 # Phase 2（OrganAMNIST, Non-IID）
 uv run python scripts/run_comparison.py config/afad_phase2_config.yaml
 
 # 特定手法のみ実行（既存結果を --load でロード）
 uv run python scripts/run_comparison.py config/afad_phase2_config.yaml \
-  --methods "AFAD + Adapter" --load results/existing.json --output results/new.json
+  --methods "AFAD + Proto" --load results/existing.json --output results/new.json
 
 # Multi-seed 統計的検証
 uv run python scripts/run_multi_seed.py config/afad_phase2_config.yaml
@@ -418,8 +411,7 @@ AFAD/
 │   ├── server/
 │   │   ├── generator/
 │   │   │   ├── fedgen_generator.py       # FedGen 潜在空間 Generator
-│   │   │   ├── afad_generator_trainer.py # サーバーサイド Generator 訓練
-│   │   │   └── family_adapter.py         # Family-aware 潜在空間アダプタ
+│   │   │   └── afad_generator_trainer.py # サーバーサイド Generator 訓練（rate-aware）
 │   │   └── strategy/
 │   │       ├── afad_strategy.py          # AFAD 統合戦略（3 モード対応）
 │   │       └── heterofl_aggregator.py    # HeteroFL 集約（count-based + label-split）
