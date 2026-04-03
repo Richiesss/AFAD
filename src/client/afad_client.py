@@ -299,7 +299,7 @@ class AFADClient(fl.client.NumPyClient):
                         sampled_y, dtype=torch.long, device=self.device
                     )
                     with torch.no_grad():
-                        gen_result = self.generator(sampled_y_t)
+                        gen_result = self.generator(sampled_y_t, rate=self.model_rate)
                         gen_latent = gen_result["output"]
 
                     gen_logits = self.model.forward_from_latent(gen_latent)
@@ -310,7 +310,7 @@ class AFADClient(fl.client.NumPyClient):
 
                     # Latent matching: KL(real output || generated output)
                     with torch.no_grad():
-                        gen_result_same = self.generator(labels)
+                        gen_result_same = self.generator(labels, rate=self.model_rate)
                         gen_latent_same = gen_result_same["output"]
 
                     gen_logits_same = self.model.forward_from_latent(gen_latent_same)
@@ -331,7 +331,7 @@ class AFADClient(fl.client.NumPyClient):
                     if self.proto_gamma > 0.0:
                         gamma = self.proto_gamma * (DECAY_RATE**glob_iter)
                         with torch.no_grad():
-                            proto_target = self.generator(labels)["output"]
+                            proto_target = self.generator(labels, rate=self.model_rate)["output"]
                         client_latent = self.model.bottleneck(
                             self.model.backbone(images)
                         )

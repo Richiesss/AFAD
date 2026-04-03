@@ -163,6 +163,7 @@ class AFADGeneratorTrainer:
         qualified_labels: list[int],
         num_epochs: int = 1,
         num_teacher_iters: int = 20,
+        model_rates: dict[str, float] | None = None,
     ) -> float:
         """Train the generator using family models' forward_from_latent.
 
@@ -170,19 +171,24 @@ class AFADGeneratorTrainer:
             L = alpha * L_teacher + eta * L_diversity
 
         where:
-        - L_teacher: Weighted CE of classifier(G(y)) across all families
-        - L_diversity: Prevents mode collapse in generator
+        - L_teacher: Weighted CE of classifier(G(y, rate)) across all models.
+            When the generator is rate_conditioned, each model uses its own
+            rate so that each output head receives a training signal.
+        - L_diversity: Prevents mode collapse (applied to rate=1.0 output).
 
         After each optimizer step, the EMA tracker is updated. The EMA
         weights are exposed via get_inference_state_dict() for distribution
         to clients, providing smoother latent representations.
 
         Args:
-            models: Dict mapping family name to FedGenModelWrapper.
-            label_weights: [num_classes, num_families] per-label weights.
+            models: Dict mapping model key to FedGenModelWrapper.
+            label_weights: [num_classes, num_models] per-label weights.
             qualified_labels: Labels with sufficient data.
             num_epochs: Generator training epochs per round.
             num_teacher_iters: Iterations per epoch.
+            model_rates: Optional dict mapping model key to HeteroFL width rate.
+                Used only when generator.rate_conditioned=True. When None,
+                all models use rate=None (rate-agnostic generation).
 
         Returns:
             Average training loss.
@@ -197,13 +203,20 @@ class AFADGeneratorTrainer:
         )
 
         self.generator.train()
-        model_list = list(models.values())
+        model_items = list(models.items())
+        model_list = [m for _, m in model_items]
 
         # Freeze all model parameters during generator training
         for model in model_list:
             model.eval()
             for p in model.parameters():
                 p.requires_grad = False
+
+        # Determine whether to use rate-conditioning
+        use_rate_cond = (
+            getattr(self.generator, "rate_conditioned", False)
+            and model_rates is not None
+        )
 
         total_loss = 0.0
         total_steps = 0
@@ -216,31 +229,59 @@ class AFADGeneratorTrainer:
                 y = np.random.choice(qualified_labels, self.batch_size)
                 y_input = torch.LongTensor(y).to(self.device)
 
-                # Generate latent vectors
-                gen_result = self.generator(y_input)
-                gen_output = gen_result["output"]
-                eps = gen_result["eps"]
-
-                # Teacher loss: weighted CE across all family models
+                # Teacher loss: weighted CE across all models
+                # When rate-conditioned, each model gets latents from its rate head.
+                # When not rate-conditioned, a single latent serves all models.
                 teacher_loss = torch.tensor(0.0, device=self.device)
+                eps_ref: torch.Tensor | None = None
+                gen_output_ref: torch.Tensor | None = None
 
-                for model_idx, model in enumerate(model_list):
-                    weight = label_weights[y, model_idx]
-                    weight_tensor = torch.tensor(
-                        weight, dtype=torch.float32, device=self.device
-                    )
+                if use_rate_cond:
+                    # Per-model generation: G(y, rate_k) for each model k
+                    for model_idx, (model_key, model) in enumerate(model_items):
+                        rate = model_rates.get(model_key, 1.0)  # type: ignore[union-attr]
+                        gen_result = self.generator(y_input, rate=rate)
+                        gen_output = gen_result["output"]
 
-                    # Use forward_from_latent: classifier(z) only
-                    logits = model.forward_from_latent(gen_output)
-                    logp = F.log_softmax(logits, dim=1)
+                        # Keep rate=1.0 output for diversity loss reference
+                        if eps_ref is None:
+                            eps_ref = gen_result["eps"]
+                            gen_output_ref = gen_output
 
-                    per_sample_loss = self.generator.crossentropy_loss(logp, y_input)
-                    teacher_loss += torch.mean(per_sample_loss * weight_tensor)
+                        weight = label_weights[y, model_idx]
+                        weight_tensor = torch.tensor(
+                            weight, dtype=torch.float32, device=self.device
+                        )
+                        logits = model.forward_from_latent(gen_output)
+                        logp = F.log_softmax(logits, dim=1)
+                        per_sample_loss = self.generator.crossentropy_loss(
+                            logp, y_input
+                        )
+                        teacher_loss += torch.mean(per_sample_loss * weight_tensor)
+                else:
+                    # Single generation: G(y) for all models (original behaviour)
+                    gen_result = self.generator(y_input)
+                    gen_output_ref = gen_result["output"]
+                    eps_ref = gen_result["eps"]
 
-                # Diversity loss
-                diversity_loss = self.generator.diversity_loss(eps, gen_output)
+                    for model_idx, model in enumerate(model_list):
+                        weight = label_weights[y, model_idx]
+                        weight_tensor = torch.tensor(
+                            weight, dtype=torch.float32, device=self.device
+                        )
+                        logits = model.forward_from_latent(gen_output_ref)
+                        logp = F.log_softmax(logits, dim=1)
+                        per_sample_loss = self.generator.crossentropy_loss(
+                            logp, y_input
+                        )
+                        teacher_loss += torch.mean(per_sample_loss * weight_tensor)
 
-                # Total loss
+                # Diversity loss on rate=1.0 (or single) output
+                assert eps_ref is not None and gen_output_ref is not None
+                diversity_loss = self.generator.diversity_loss(
+                    eps_ref, gen_output_ref
+                )
+
                 loss = (
                     self.ensemble_alpha * teacher_loss
                     + self.ensemble_eta * diversity_loss

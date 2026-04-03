@@ -250,6 +250,7 @@ def afad_client_fn_builder(
     local_epochs: int,
     cid_to_rate: dict[str, float],
     proto_gamma: float = 0.0,
+    rate_conditioned: bool = False,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -271,6 +272,7 @@ def afad_client_fn_builder(
             noise_dim=LATENT_DIM,
             num_classes=num_classes,
             latent_dim=LATENT_DIM,
+            rate_conditioned=rate_conditioned,
         )
         train_loader = train_loaders[int(cid) % len(train_loaders)]
 
@@ -316,6 +318,7 @@ def _build_strategy(
     family_model_names: dict[str, str],
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
+    rate_conditioned: bool = False,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
@@ -329,6 +332,7 @@ def _build_strategy(
             noise_dim=LATENT_DIM,
             num_classes=num_classes,
             latent_dim=LATENT_DIM,
+            rate_conditioned=rate_conditioned,
         )
 
     # Model factories
@@ -427,6 +431,7 @@ def run_single_experiment(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     proto_gamma: float = 0.0,
+    rate_conditioned: bool = False,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -456,6 +461,7 @@ def run_single_experiment(
         family_model_names=family_model_names,
         training_cfg=training_cfg,
         fedgen_cfg=fedgen_cfg,
+        rate_conditioned=rate_conditioned,
     )
 
     # Build client_fn based on experiment mode
@@ -470,6 +476,7 @@ def run_single_experiment(
             local_epochs,
             cid_to_rate,
             proto_gamma=proto_gamma,
+            rate_conditioned=rate_conditioned,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -688,7 +695,7 @@ def main():
         logger.info(f"Loaded existing results from {args.load}: {list(results.keys())}")
 
     # Determine which methods to run
-    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Proto"]
+    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Proto", "AFAD + RateCond"]
     if args.methods:
         methods_to_run = [m.strip() for m in args.methods.split(",")]
     else:
@@ -699,7 +706,8 @@ def main():
         "HeteroFL Only": {"enable_fedgen": False, "enable_heterofl": True},
         "FedGen Only":   {"enable_fedgen": True,  "enable_heterofl": False},
         "AFAD Hybrid":   {"enable_fedgen": True,  "enable_heterofl": True},
-        "AFAD + Proto":  {"enable_fedgen": True,  "enable_heterofl": True,  "proto_gamma": 1.0},
+        "AFAD + Proto":     {"enable_fedgen": True,  "enable_heterofl": True,  "proto_gamma": 1.0},
+        "AFAD + RateCond":  {"enable_fedgen": True,  "enable_heterofl": True,  "rate_conditioned": True},
     }
 
     for method in methods_to_run:

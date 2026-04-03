@@ -519,6 +519,18 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 label_counts_list, num_classes=self.num_classes
             )
 
+        # Build per-model rate map for rate-conditioned generator training.
+        # Keys: 'cnn' / 'vit' → rate=1.0; 'cnn_r0.5' → rate=0.5, etc.
+        model_rates: dict[str, float] = {}
+        for key in torch_models:
+            if "_r" in key:
+                try:
+                    model_rates[key] = float(key.split("_r")[-1])
+                except ValueError:
+                    model_rates[key] = 1.0
+            else:
+                model_rates[key] = 1.0
+
         # Train generator using forward_from_latent
         self.generator_trainer.train_generator(
             models=torch_models,
@@ -526,6 +538,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             qualified_labels=qualified_labels,
             num_epochs=self._gen_epochs,
             num_teacher_iters=self._gen_teacher_iters,
+            model_rates=model_rates,
         )
 
         self._generator_trained = True
