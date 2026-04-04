@@ -250,6 +250,9 @@ def afad_client_fn_builder(
     num_classes: int,
     local_epochs: int,
     cid_to_rate: dict[str, float],
+    skip_small_rate_kd: bool = False,
+    rate_adaptive_temperature: bool = False,
+    logit_only_kd: bool = False,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -274,12 +277,6 @@ def afad_client_fn_builder(
         )
         train_loader = train_loaders[int(cid) % len(train_loaders)]
 
-        # Rate-dependent KD scaling: sub-rate clients get stronger guidance.
-        # alpha = 0.5 / rate: rate=1.0->0.5, rate=0.5->1.0, rate=0.25->2.0
-        # Kept conservative: AFAD generator is trained on full-rate classifiers
-        # so higher alpha destabilises training for sub-rate clients (CUDA OOM risk).
-        # Exp C finding: selective KD (rate=1.0 only, alpha=10) showed +0.5% at R26
-        # but alpha=10 caused GPU instability after R26 -> not used in production.
         kd_scale = 0.5 / model_rate
         return AFADClient(
             cid=cid,
@@ -295,6 +292,9 @@ def afad_client_fn_builder(
             num_classes=num_classes,
             generative_alpha=kd_scale,
             generative_beta=kd_scale,
+            skip_small_rate_kd=skip_small_rate_kd,
+            rate_adaptive_temperature=rate_adaptive_temperature,
+            logit_only_kd=logit_only_kd,
         ).to_client()
 
     return client_fn
@@ -500,6 +500,9 @@ def run_single_experiment(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     use_adapters: bool = False,
+    skip_small_rate_kd: bool = False,
+    rate_adaptive_temperature: bool = False,
+    logit_only_kd: bool = False,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -545,7 +548,7 @@ def run_single_experiment(
             cid_to_rate,
         )
     elif enable_heterofl and enable_fedgen:
-        # AFAD Hybrid
+        # AFAD Hybrid (with optional IID KD fixes)
         client_fn = afad_client_fn_builder(
             train_loaders,
             test_loader,
@@ -554,6 +557,9 @@ def run_single_experiment(
             num_classes,
             local_epochs,
             cid_to_rate,
+            skip_small_rate_kd=skip_small_rate_kd,
+            rate_adaptive_temperature=rate_adaptive_temperature,
+            logit_only_kd=logit_only_kd,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -772,7 +778,10 @@ def main():
         logger.info(f"Loaded existing results from {args.load}: {list(results.keys())}")
 
     # Determine which methods to run
-    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Adapter"]
+    all_methods = [
+        "HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Adapter",
+        "AFAD + Skip025", "AFAD + TempKD", "AFAD + LogitKD", "AFAD + IID Fix",
+    ]
     if args.methods:
         methods_to_run = [m.strip() for m in args.methods.split(",")]
     else:
@@ -784,6 +793,17 @@ def main():
         "FedGen Only":    {"enable_fedgen": True,  "enable_heterofl": False, "use_adapters": False},
         "AFAD Hybrid":    {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False},
         "AFAD + Adapter": {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": True},
+        # IID KD fixes (TAKD 2020 + literature-backed)
+        "AFAD + Skip025": {"enable_fedgen": True, "enable_heterofl": True,
+                           "skip_small_rate_kd": True},
+        "AFAD + TempKD":  {"enable_fedgen": True, "enable_heterofl": True,
+                           "rate_adaptive_temperature": True},
+        "AFAD + LogitKD": {"enable_fedgen": True, "enable_heterofl": True,
+                           "logit_only_kd": True},
+        "AFAD + IID Fix": {"enable_fedgen": True, "enable_heterofl": True,
+                           "skip_small_rate_kd": True,
+                           "rate_adaptive_temperature": True,
+                           "logit_only_kd": True},
     }
 
     for method in methods_to_run:

@@ -87,6 +87,9 @@ class AFADClient(fl.client.NumPyClient):
         generative_beta: float = DEFAULT_GENERATIVE_BETA,
         gen_batch_size: int = 32,
         family_adapter: nn.Module | None = None,
+        skip_small_rate_kd: bool = False,
+        rate_adaptive_temperature: bool = False,
+        logit_only_kd: bool = False,
     ):
         self.cid = cid
         self.model = model
@@ -110,6 +113,9 @@ class AFADClient(fl.client.NumPyClient):
         self.generative_alpha = generative_alpha
         self.generative_beta = generative_beta
         self.gen_batch_size = gen_batch_size
+        self.skip_small_rate_kd = skip_small_rate_kd
+        self.rate_adaptive_temperature = rate_adaptive_temperature
+        self.logit_only_kd = logit_only_kd
 
         # Precompute label counts and available labels
         self.label_counts = self._compute_label_counts()
@@ -307,9 +313,19 @@ class AFADClient(fl.client.NumPyClient):
                     loss = loss + (fedprox_mu / 2.0) * prox_term
 
                 # FedGen regularization (after first round, before early stop)
-                if regularization and epoch < EARLY_STOP_EPOCH:
+                # skip_small_rate_kd: TAKD finding — capacity gap > 4x makes KD harmful
+                kd_active = (
+                    regularization
+                    and epoch < EARLY_STOP_EPOCH
+                    and not (self.skip_small_rate_kd and self.model_rate <= 0.25)
+                )
+                if kd_active:
                     alpha = self.generative_alpha * (DECAY_RATE**glob_iter)
                     beta = self.generative_beta * (DECAY_RATE**glob_iter)
+
+                    # rate_adaptive_temperature: T = 1/rate so small models get
+                    # softer targets (literature consensus for capacity-mismatched KD)
+                    T = 1.0 / self.model_rate if self.rate_adaptive_temperature else 1.0
 
                     # Teacher loss: CE on generated latents with random labels
                     sampled_y = np.random.choice(
@@ -325,27 +341,31 @@ class AFADClient(fl.client.NumPyClient):
                             gen_latent = self.family_adapter(gen_latent)
 
                     gen_logits = self.model.forward_from_latent(gen_latent)
-                    gen_logp = F.log_softmax(gen_logits, dim=1)
-                    teacher_loss = alpha * torch.mean(
+                    gen_logp = F.log_softmax(gen_logits / T, dim=1)
+                    # T^2 restores loss magnitude after temperature scaling
+                    teacher_loss = alpha * T**2 * torch.mean(
                         FedGenGenerator.crossentropy_loss(gen_logp, sampled_y_t)
                     )
 
-                    # Latent matching: KL(real output || generated output)
-                    with torch.no_grad():
-                        gen_result_same = self.generator(labels)
-                        gen_latent_same = gen_result_same["output"]
-                        if self.family_adapter is not None:
-                            gen_latent_same = self.family_adapter(gen_latent_same)
-
-                    gen_logits_same = self.model.forward_from_latent(gen_latent_same)
-                    target_p = F.softmax(gen_logits_same, dim=1).clone().detach()
-                    user_logp = F.log_softmax(logits, dim=1)
-                    latent_loss = beta * F.kl_div(
-                        user_logp, target_p, reduction="batchmean"
-                    )
-
                     gen_ratio = self.gen_batch_size / images.size(0)
-                    loss = loss + gen_ratio * teacher_loss + latent_loss
+                    loss = loss + gen_ratio * teacher_loss
+
+                    # logit_only_kd: skip latent matching (bypasses dim mismatch)
+                    if not self.logit_only_kd:
+                        # Latent matching: KL(real output || generated output)
+                        with torch.no_grad():
+                            gen_result_same = self.generator(labels)
+                            gen_latent_same = gen_result_same["output"]
+                            if self.family_adapter is not None:
+                                gen_latent_same = self.family_adapter(gen_latent_same)
+
+                        gen_logits_same = self.model.forward_from_latent(gen_latent_same)
+                        target_p = F.softmax(gen_logits_same / T, dim=1).clone().detach()
+                        user_logp = F.log_softmax(logits / T, dim=1)
+                        latent_loss = beta * T**2 * F.kl_div(
+                            user_logp, target_p, reduction="batchmean"
+                        )
+                        loss = loss + latent_loss
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
