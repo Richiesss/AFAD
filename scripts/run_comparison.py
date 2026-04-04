@@ -253,6 +253,7 @@ def afad_client_fn_builder(
     skip_small_rate_kd: bool = False,
     rate_adaptive_temperature: bool = False,
     logit_only_kd: bool = False,
+    proj_gamma: float = 0.0,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -295,6 +296,8 @@ def afad_client_fn_builder(
             skip_small_rate_kd=skip_small_rate_kd,
             rate_adaptive_temperature=rate_adaptive_temperature,
             logit_only_kd=logit_only_kd,
+            proj_gamma=proj_gamma,
+            latent_dim=LATENT_DIM,
         ).to_client()
 
     return client_fn
@@ -503,6 +506,7 @@ def run_single_experiment(
     skip_small_rate_kd: bool = False,
     rate_adaptive_temperature: bool = False,
     logit_only_kd: bool = False,
+    proj_gamma: float = 0.0,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -560,6 +564,7 @@ def run_single_experiment(
             skip_small_rate_kd=skip_small_rate_kd,
             rate_adaptive_temperature=rate_adaptive_temperature,
             logit_only_kd=logit_only_kd,
+            proj_gamma=proj_gamma,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -781,6 +786,7 @@ def main():
     all_methods = [
         "HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Adapter",
         "AFAD + Skip025", "AFAD + TempKD", "AFAD + LogitKD", "AFAD + IID Fix",
+        "AFAD + ProjHead",
     ]
     if args.methods:
         methods_to_run = [m.strip() for m in args.methods.split(",")]
@@ -804,6 +810,9 @@ def main():
                            "skip_small_rate_kd": True,
                            "rate_adaptive_temperature": True,
                            "logit_only_kd": True},
+        # Projection Head: P_r: z_{eff} → z_{32} (FedFD / Codex Idea 4)
+        "AFAD + ProjHead": {"enable_fedgen": True, "enable_heterofl": True,
+                            "proj_gamma": 1.0},
     }
 
     for method in methods_to_run:

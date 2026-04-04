@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.fedgen_wrapper import FedGenModelWrapper
+from src.models.projection_head import ProjectionHead
 from src.server.generator.fedgen_generator import FedGenGenerator
 from src.utils.logger import setup_logger
 
@@ -90,6 +91,8 @@ class AFADClient(fl.client.NumPyClient):
         skip_small_rate_kd: bool = False,
         rate_adaptive_temperature: bool = False,
         logit_only_kd: bool = False,
+        proj_gamma: float = 0.0,
+        latent_dim: int = 32,
     ):
         self.cid = cid
         self.model = model
@@ -116,6 +119,14 @@ class AFADClient(fl.client.NumPyClient):
         self.skip_small_rate_kd = skip_small_rate_kd
         self.rate_adaptive_temperature = rate_adaptive_temperature
         self.logit_only_kd = logit_only_kd
+        self.proj_gamma = proj_gamma
+        self.latent_dim = latent_dim
+
+        # Projection head: P_r: z_{eff} → z_{32}
+        # HeteroFL sets only the first int(latent_dim*rate) rows of bottleneck,
+        # so the effective latent dimension is rate-scaled.
+        effective_dim = max(1, int(latent_dim * model_rate))
+        self.proj_head = ProjectionHead(effective_dim, latent_dim).to(self.device)
 
         # Precompute label counts and available labels
         self.label_counts = self._compute_label_counts()
@@ -282,13 +293,18 @@ class AFADClient(fl.client.NumPyClient):
         FedProx: proximal term (mu/2)||w - w_global||^2 for Non-IID stability.
         """
         criterion = nn.CrossEntropyLoss()
+        # Include proj_head in optimizer so it trains alongside the model
+        all_params = list(self.model.parameters())
+        if self.proj_gamma > 0.0:
+            all_params += list(self.proj_head.parameters())
         optimizer = torch.optim.SGD(
-            self.model.parameters(),
+            all_params,
             lr=self.lr,
             momentum=self.momentum,
             weight_decay=self.weight_decay,
         )
         self.model.train()
+        self.proj_head.train()
         self.generator.eval()
         if self.family_adapter is not None:
             self.family_adapter.eval()
@@ -366,6 +382,20 @@ class AFADClient(fl.client.NumPyClient):
                             user_logp, target_p, reduction="batchmean"
                         )
                         loss = loss + latent_loss
+
+                # Projection Head loss: align P_r(z_eff) with generator latent
+                # (FedFD / Codex Idea 4: dimension-matched KD in 32-dim space)
+                if self.proj_gamma > 0.0:
+                    gamma = self.proj_gamma * (DECAY_RATE**glob_iter)
+                    with torch.no_grad():
+                        features = self.model.backbone(images)
+                        client_latent = self.model.bottleneck(features)
+                        gen_target = self.generator(labels)["output"]
+                    effective_dim = max(1, int(self.latent_dim * self.model_rate))
+                    z_eff = client_latent[:, :effective_dim]
+                    proj_latent = self.proj_head(z_eff)
+                    proj_loss = gamma * F.mse_loss(proj_latent, gen_target)
+                    loss = loss + proj_loss
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
