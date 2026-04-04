@@ -146,100 +146,191 @@ AFAD の改善推移（ナイーブ統合からの 4 段階改善）:
 | FedGen Only | 99.60% | 99.57% | 579s |
 | **AFAD Hybrid** | **99.35%** | **99.29%** | **325s** |
 
-AFAD は HeteroFL と FedGen の中間に位置し、単独では達成できない設定（異なるアーキテクチャ × 異なる幅）をカバーしながら高い精度を維持する。また実行時間は 3 手法中最短。
-
 ### Phase 2: OrganAMNIST（Non-IID α=0.5, 10 clients, 40 rounds）
 
 > Dirichlet 分割によるデータ不均質環境。seed=42 の単一試行。
 
-| 手法 | BEST |
-|------|:----:|
-| HeteroFL Only | 65.36% |
-| **AFAD Hybrid** | **67.08%** |
-| FedGen Only | 84.66% |
+| 手法 | BEST | 備考 |
+|------|:----:|------|
+| HeteroFL Only | 65.36% | ベースライン |
+| AFAD Hybrid | 67.08% | +1.72pp vs HeteroFL |
+| AFAD + Prototype Anchoring | **68.00%** | +0.92pp vs AFAD Hybrid |
+| FedGen Only | 84.66% | **目標** (pure homogeneous) |
 
-Non-IID 環境では FedGen Only が最も高い精度（84.66%）を達成する。FedGen Generator がサーバー側でクラスバランスの取れた潜在ベクトルを生成するため、データ不均質の影響を受けにくい。一方 AFAD は HeteroFL を +1.72pp 上回るが、FedGen との差は **17.58pp** 残る。
+Non-IID 環境では FedGen Only が最も高い精度（84.66%）を達成する。Generator がサーバー側でクラスバランスの取れた潜在ベクトルを生成するため、データ不均質の影響を受けにくい。一方 AFAD は HeteroFL を +1.72pp 上回るが、FedGen との差は **16.66pp** 残る（構造的問題、後述）。
 
-この差は「構造的な問題」として分析されており、単純なハイパーパラメータ調整（KD 係数の増加など）では解消できないことが実験的に確認されている（詳細は後述のアブレーション実験を参照）。
+### Phase 2: OrganAMNIST（**IID**, 10 clients, 40 rounds）
 
-### アブレーション実験（Phase 2 ベース）
+> IID 環境で KD の効果を単独検証。
 
-Phase 2 の AFAD vs FedGen ギャップの原因を特定するために実施したアブレーション。
+| 手法 | BEST | vs HeteroFL |
+|------|:----:|:-----------:|
+| HeteroFL Only | 83.39% | — |
+| **FedGen Only** | **86.49%** | +3.10pp ← **IID 目標** |
+| AFAD Hybrid | 76.96% | **−6.43pp** ← KD が悪化 |
+| AFAD + RateCond | 81.88% | −1.51pp |
+
+**重要な発見**: IID 環境でも KD が大幅に悪化する（−6.43pp）。この発見が以降の研究方針を決定した。
+
+### アブレーション実験（Phase 2 Non-IID ベース）
 
 | 実験 | 変更内容 | 結果 | 解釈 |
 |------|---------|------|------|
-| **Exp A** | FedProx 無効化（mu=0 → 0） | −0.23pp（AFAD 比） | FedProx は役立っている（競合せず） |
-| **Exp C** | KD を rate=1.0 クライアントのみに適用、α=10 | +0.32pp（R26 時点）、その後不安定 | KD 係数を増やしても根本解決にならない |
-
-**結論**: AFAD vs FedGen のギャップは構造的問題。Generator が rate=1.0 のフルレートモデルの潜在空間に最適化されているため、rate<1.0 のサブレートクライアントは KD 信号を適切に活用できない。
+| **Exp A** | FedProx 無効化（mu=0） | −0.23pp（AFAD 比） | FedProx は役立っている（KD と競合しない） |
+| **Exp C** | KD を rate=1.0 のみ・α=10 | +0.32pp（R26 時点）、その後不安定 | KD 係数を増やしても根本解決にならない |
 
 ---
 
-## AFAD + Adapter（Family-aware Latent Adapter）
+## IID ギャップの根本原因分析
 
-### 問題の根本原因と解決策
+### なぜ IID でも KD が悪化するのか
 
 ```
-Generator  ──z──→  FamilyAdapter ──z'──→  forward_from_latent()
-(サーバー訓練)      (per-family MLP)       (クライアント分類器)
-                                              ↑
-                                      Sub-rate クライアントでは
-                                      潜在空間の意味論が異なる
+Generator が生成する潜在ベクトル: z ∈ ℝ^32
+                    ↓
+   rate=1.0 クライアント: bottleneck out ∈ ℝ^32 → マッチ ✓
+   rate=0.5 クライアント: bottleneck out ∈ ℝ^32 だが有効次元は 16 → ミスマッチ ✗
+   rate=0.25 クライアント: bottleneck out ∈ ℝ^32 だが有効次元は 8  → 大きなミスマッチ ✗
 ```
 
-**問題**: Generator は `rate=1.0` のフルレートモデルを教師として訓練される。Sub-rate クライアント（rate=0.5/0.25）は幅縮小 bottleneck により異なる潜在表現を学習するため、Generator の潜在ベクトルが直接使用できない。
+HeteroFL の幅スケーリングは bottleneck の **先頭 `int(32 × rate)` 行** のみを配布・更新する。
+つまり sub-rate クライアントの bottleneck は実質的に低次元空間に生きており、Generator の 32 次元出力と幾何学的に整合していない。
 
-**解決策**: `FamilyAdapter`（残差 MLP: 32→64→32）を family ごとにサーバーで訓練し、Generator の潜在ベクトルを各 family の潜在空間へ変換してからクライアントに送信する。
+**TAKD（AAAI 2020）の知見との一致**: 容量差が 4× を超える場合（rate=0.25 → 8-dim vs 32-dim = 4倍）、KD は有害になる。
 
-### 設計の詳細
+| rate | 有効次元 | 容量比（vs Generator 32-dim） |
+|------|:--------:|:----------------------------:|
+| 1.0  | 32       | 1×（整合）|
+| 0.5  | 16       | 2×（軽微なミスマッチ）|
+| 0.25 |  8       | 4×（TAKD 基準を超過）|
+
+---
+
+## IID ギャップ解消のための改善履歴
+
+### 1. Rate-Conditioned Generator（`feature/rate-conditioned-generator`）
+
+**アイデア**: Generator をレートごとに異なるヘッドで訓練 `G(y, rate)` → rate 対応の潜在ベクトルを生成。
 
 ```python
-# family_adapter.py
-class FamilyAdapter(nn.Module):
-    def __init__(self, latent_dim=32, hidden_multiplier=2):
-        hidden_dim = latent_dim * hidden_multiplier  # 32 → 64
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),  # 32 → 64
-            nn.ReLU(),
-            nn.Linear(hidden_dim, latent_dim),  # 64 → 32
-        )
-    def forward(self, z):
-        return self.net(z) + z  # 残差接続（初期状態≈恒等変換）
+# rate=1.0 → 32-dim head, rate=0.5 → 16-dim head, rate=0.25 → 8-dim head
+gen_output = generator(labels, model_rate=rate)
 ```
 
-| 設計項目 | 選択 | 理由 |
-|----------|------|------|
-| **学習方式** | Generator 凍結後に Adapter を別途訓練（Separate） | 勾配干渉を回避；Generatorの安定収束後に写像を学習 |
-| **Adapter 数** | Per-family 2 個（CNN / ViT） | 実装のシンプルさを優先；Per-(family,rate) 6 個は今後の拡張 |
-| **残差接続** | あり | 初期ラウンドで Adapter が恒等変換に近い状態を保つ |
-| **学習率** | Generator と同じ `gen_lr=3e-4` | Separate 訓練のため干渉なし；収束は速い |
+**結果**（Non-IID）:
 
-### 変更ファイル（既存コードへの影響なし）
+| 手法 | BEST |
+|------|:----:|
+| AFAD Hybrid（ベース） | 67.08% |
+| AFAD + RateCond | 66.73% |
 
-| ファイル | 変更内容 |
-|----------|---------|
-| `src/server/generator/family_adapter.py` | **新規追加** — `FamilyAdapter` + `FamilyAdapterBank` |
-| `src/server/generator/afad_generator_trainer.py` | `train_adapters()` メソッド追加 |
-| `src/server/strategy/afad_strategy.py` | `configure_fit()` でアダプタをシリアライズ、`_train_generator_on_server()` でアダプタ訓練 |
-| `src/client/afad_client.py` | `family_adapter` 受信・適用ロジック追加 |
-| `scripts/run_comparison.py` | 第 4 手法 `"AFAD + Adapter"` の追加 |
+→ **−0.35pp**。Generator が 40 ラウンドでは rate 別ヘッドを十分学習できず逆効果。IID では +4.92pp（83.39% → 88.31% 相当）の改善を示した（後述）。
 
-> **制約**: `fedgen_client.py`, `fedgen_distiller.py`, `heterofl_resnet.py`, `heterofl_vit.py`, `heterofl_aggregator.py`, `heterofl_client.py` は一切変更せず。
+### 2. Prototype Anchoring（`feature/prototype-anchoring`）
+
+**アイデア**: クライアントの bottleneck 出力を Generator の同クラス出力に近づける補助損失（直接的な潜在空間アンカリング）。
+
+$$\mathcal{L}_{\text{proto}} = \gamma \cdot \text{MSE}(\text{bottleneck}(\text{backbone}(x)),\; G(y))$$
+
+`γ = 1.0`、`0.98^{\text{round}}` で減衰。
+
+**結果**（Non-IID）:
+
+| 手法 | BEST |
+|------|:----:|
+| AFAD Hybrid | 67.08% |
+| **AFAD + Proto** | **68.00%** |
+
+→ **+0.92pp**。Non-IID 環境での構造的ギャップを部分的に改善。
+
+**限界**: Proto Anchoring は次元ミスマッチを解消せず（sub-rate bottleneck は 8/16-dim 有効、MSE は全 32-dim で計算）。IID でも改善効果は限定的。
+
+### 3. IID KD Fix（`feature/iid-kd-fix`）
+
+文献調査（TAKD 2020, FedProto 2022 等）に基づき 3 つの Ablation を実装。
+
+| 手法 | メカニズム | 出典 |
+|------|-----------|------|
+| **skip_small_rate_kd** | rate ≤ 0.25 では KD を無効化（容量差 4× → 有害） | TAKD, AAAI 2020 |
+| **rate_adaptive_temperature** | T = 1/rate（小容量モデルにはソフトなターゲット）; T² でロス大きさを補正 | KD 温度スケーリング文献 |
+| **logit_only_kd** | 潜在マッチング KL 損失を削除、ロジット CE のみ（次元ミスマッチ回避） | FedProto 2022 |
+
+**結果**（OrganAMNIST, IID）:
+
+| 手法 | BEST | vs AFAD Hybrid (76.96%) |
+|------|:----:|:----------------------:|
+| HeteroFL Only | 83.39% | 目標 −6.43pp |
+| FedGen Only | 86.49% | 目標 +9.53pp |
+| AFAD Hybrid（ベース） | 76.96% | — |
+| AFAD + Skip025 | 76.72% | −0.24pp |
+| AFAD + TempKD | **77.56%** | **+0.60pp** |
+| AFAD + LogitKD | 76.57% | −0.39pp |
+| AFAD + IID Fix（全3つ） | 76.31% | −0.65pp |
+
+→ 最大改善は TempKD の +0.60pp。**FedGen との IID ギャップ（9.53pp）をほとんど縮められず**。根本的な次元ミスマッチを解決する必要性が確認された。
+
+**考察**: logit_only_kd で潜在マッチング損失を除去しても改善しない → 問題は損失の種類ではなく、sub-rate クライアントが 32-dim の KD 信号を受けられる「次元のある空間」を持たないこと。
+
+### 4. Projection Head（`feature/projection-heads` — 現在進行中）
+
+**根本的解決策**: sub-rate クライアントに「射影ヘッド」を追加し、有効次元の潜在ベクトルを Generator の 32-dim 空間に明示的にマッピングする。
+
+```
+rate=0.5 クライアント:
+  backbone → bottleneck → z_{full} ∈ ℝ^32
+                                ↓ スライス
+               z_{eff} = z_{full}[:16] ∈ ℝ^16
+                                ↓ ProjectionHead P_r
+               z_{proj} = P_r(z_{eff}) ∈ ℝ^32
+                                ↓
+               KD損失: MSE(z_{proj}, G(y)) ✓  ← 次元一致
+```
+
+**実装**（`src/models/projection_head.py`）:
+
+```python
+class ProjectionHead(nn.Module):
+    """P_r: z_{eff} → z_{32} (linear, bias=False)"""
+    def __init__(self, effective_dim: int, latent_dim: int = 32):
+        self.proj = nn.Linear(effective_dim, latent_dim, bias=False)
+    def forward(self, z_eff):
+        return self.proj(z_eff)
+```
+
+**損失関数（proj_loss）**:
+
+$$\mathcal{L}_{\text{proj}} = \gamma \cdot \text{MSE}(P_r(z_{\text{eff}}),\, G(y))$$
+
+- `γ = proj_gamma * 0.98^round` で指数減衰
+- `z_eff = client_latent[:, :int(latent_dim * rate)]`（有効次元のみ取り出し）
+- proj_head のパラメータは main optimizer に含める（モデルと同時学習）
+
+| rate | effective_dim | ProjectionHead サイズ |
+|------|:-------------:|:---------------------:|
+| 1.0  | 32            | 32→32（恒等変換に近い幾何学的整列）|
+| 0.5  | 16            | 16→32（2× アップ射影）|
+| 0.25 |  8            | 8→32（4× アップ射影）|
+
+**理論的根拠** (Codex Idea 4, FedFD 2023):
+- IID 環境では全クラスが均等に現れるため、P_r が低歪みのマッピングを学習できる
+- Non-IID では少数クラスバイアスのリスクがあるが、初期改善の確認を優先
+
+**現状**: IID 実験実行中（結果は後述）。
 
 ---
 
 ## 各手法の比較
 
-| | HeteroFL Only | FedGen Only | AFAD Hybrid | AFAD + Adapter |
+| | HeteroFL Only | FedGen Only | AFAD Hybrid | AFAD + ProjHead |
 |---|:---:|:---:|:---:|:---:|
 | 計算能力の異種性 (rate 可変) | ○ | × | **○** | **○** |
 | アーキテクチャ異種性 (CNN ↔ ViT) | × | ○ | **○** | **○** |
-| sub-rate クライアントへの知識補完 | × | △ | ○ | **◎** |
-| Non-IID 耐性 | 中 | 高 | 中 | 中〜高 |
+| sub-rate クライアントへの知識補完 | × | △ | △ | **○** |
+| 次元ミスマッチ解消 | × | — | × | **○** |
+| Non-IID 耐性 | 中 | 高 | 中 | 中 |
 | 集約方式 | count-based | FedAvg | count-based | count-based |
-| クライアント損失 | CE のみ | CE + KD (α/β=10 固定) | CE + KD (α/β=0.5/rate) | CE + KD + Adapter 補正 |
+| クライアント損失 | CE のみ | CE + KD | CE + KD | CE + KD + ProjHead MSE |
 | サーバー Generator | なし | あり | あり | あり |
-| 潜在空間アダプタ | なし | なし | なし | **あり（per-family）** |
 
 ---
 
@@ -267,11 +358,12 @@ Server (AFADStrategy)
     └── 加重平均で全体精度を集約
 
 Clients
-├── HeteroFLClient — CE 損失のみ / shape-aware set_parameters / KD なし
-├── FedGenClient   — CE + KD（α=β=10 固定）/ フルレート / FedAvg 前提
-└── AFADClient     — CE + KD（α=β=0.5/rate）/ 幅スケール / HeteroFL 前提
-                     shape-aware set_parameters / FedProx 対応
-                     FamilyAdapter オプション対応（adapter_params 受信時に適用）
+├── HeteroFLClient  — CE 損失のみ / shape-aware set_parameters / KD なし
+├── FedGenClient    — CE + KD（α=β=10 固定）/ フルレート / FedAvg 前提
+└── AFADClient      — CE + KD（α=β=0.5/rate）/ 幅スケール / HeteroFL 前提
+                      shape-aware set_parameters / FedProx 対応
+                      ProjectionHead（proj_gamma>0 時に有効）
+                      オプション: skip_small_rate_kd / rate_adaptive_temperature / logit_only_kd
 ```
 
 ---
@@ -338,49 +430,43 @@ uv run python scripts/run_direct_sim.py --output results/my_run.json
 uv run python scripts/run_quick_test.py
 ```
 
-出力例:
-
-```
-============================================================
-  AFAD Hybrid
-  enable_fedgen=True, enable_heterofl=True
-============================================================
-  Round  1/30: acc=0.2865  loss=2.2801  time=3.2s
-  ...
-  Round 30/30: acc=0.6970  loss=1.1139  time=7.6s
-
-==========================================================================
-  COMPARISON: Accuracy per Round
-==========================================================================
-Round |        HeteroFL Only |          FedGen Only |          AFAD Hybrid
---------------------------------------------------------------------------
-    1 |              23.40% |              30.85% |              29.00%
-   ...
-   30 |              69.50% |              66.85% |              69.70%
---------------------------------------------------------------------------
- BEST |              69.90% |              67.00% |              69.85%
-FINAL |              69.50% |              66.85% |              69.70%
-```
-
 ### Flower シミュレーション
 
 ```bash
-# 3 手法比較（MNIST, IID, 5 clients, 40 rounds）
-uv run python scripts/run_comparison.py
+# Phase 1（MNIST, IID, 5 clients, 40 rounds）
+uv run python scripts/run_comparison.py config/afad_config.yaml
 
-# 4 手法比較（HeteroFL / FedGen / AFAD / AFAD+Adapter）
-uv run python scripts/run_comparison.py --methods "HeteroFL Only" "FedGen Only" "AFAD Hybrid" "AFAD + Adapter"
-
-# Phase 2（OrganAMNIST, Non-IID）
+# Phase 2（OrganAMNIST, Non-IID α=0.5, 10 clients, 40 rounds）
 uv run python scripts/run_comparison.py config/afad_phase2_config.yaml
 
-# 特定手法のみ実行（既存結果を --load でロード）
+# Phase 2（OrganAMNIST, IID, 10 clients, 40 rounds）
+uv run python scripts/run_comparison.py config/afad_phase2_iid_config.yaml
+
+# 特定手法のみ実行
+uv run python scripts/run_comparison.py config/afad_phase2_iid_config.yaml \
+  --methods "AFAD + ProjHead" "HeteroFL Only" "FedGen Only" "AFAD Hybrid" \
+  --output results/comparison_iid_projhead.json
+
+# 既存結果をロードして追加実験
 uv run python scripts/run_comparison.py config/afad_phase2_config.yaml \
-  --methods "AFAD + Adapter" --load results/existing.json --output results/new.json
+  --methods "AFAD + ProjHead" --load results/existing.json --output results/new.json
 
 # Multi-seed 統計的検証
 uv run python scripts/run_multi_seed.py config/afad_phase2_config.yaml
 ```
+
+#### 利用可能な手法一覧（`--methods` オプション）
+
+| 手法名 | 設定 |
+|--------|------|
+| `HeteroFL Only` | KD なし、幅スケーリングのみ |
+| `FedGen Only` | 同一幅、FedGen KD（α=β=10）|
+| `AFAD Hybrid` | HeteroFL + FedGen KD（α=β=0.5/rate）|
+| `AFAD + Skip025` | rate≤0.25 の KD を無効化 |
+| `AFAD + TempKD` | 温度 T=1/rate で KD |
+| `AFAD + LogitKD` | ロジット CE のみ（潜在マッチング削除）|
+| `AFAD + IID Fix` | Skip025 + TempKD + LogitKD 全部 |
+| `AFAD + ProjHead` | ProjectionHead による次元整合 KD（`proj_gamma=1.0`）|
 
 ---
 
@@ -391,12 +477,13 @@ AFAD/
 ├── scripts/
 │   ├── run_direct_sim.py           # 直接シミュレーション（推奨）
 │   ├── run_quick_test.py           # 4 clients・5 rounds のクイック検証
-│   ├── run_comparison.py           # 3 手法比較（Flower ベース）
+│   ├── run_comparison.py           # 多手法比較（Flower ベース）
 │   ├── run_multi_seed.py           # Multi-seed 統計的検証
 │   └── run_experiment.py           # 単一実験スクリプト
 ├── src/
 │   ├── client/
 │   │   ├── afad_client.py          # AFAD ハイブリッドクライアント
+│   │   │                           #   (KD + FedProx + ProjectionHead)
 │   │   ├── heterofl_client.py      # HeteroFL Only ベースライン
 │   │   └── fedgen_client.py        # FedGen Only ベースライン
 │   ├── data/
@@ -406,6 +493,7 @@ AFAD/
 │   ├── models/
 │   │   ├── registry.py             # モデルレジストリ（ファクトリパターン）
 │   │   ├── fedgen_wrapper.py       # FedGenModelWrapper（bottleneck + classifier）
+│   │   ├── projection_head.py      # ProjectionHead P_r: z_{eff} → z_{32}
 │   │   ├── scaler.py               # HeteroFL Scaler（1/rate 補償）
 │   │   ├── cnn/
 │   │   │   ├── heterofl_resnet.py  # 幅スケーラブル ResNet18（sBN + 1× Scaler）
@@ -418,8 +506,7 @@ AFAD/
 │   ├── server/
 │   │   ├── generator/
 │   │   │   ├── fedgen_generator.py       # FedGen 潜在空間 Generator
-│   │   │   ├── afad_generator_trainer.py # サーバーサイド Generator 訓練
-│   │   │   └── family_adapter.py         # Family-aware 潜在空間アダプタ
+│   │   │   └── afad_generator_trainer.py # サーバーサイド Generator 訓練
 │   │   └── strategy/
 │   │       ├── afad_strategy.py          # AFAD 統合戦略（3 モード対応）
 │   │       └── heterofl_aggregator.py    # HeteroFL 集約（count-based + label-split）
@@ -435,8 +522,12 @@ AFAD/
 │   └── ...
 ├── config/
 │   ├── afad_config.yaml            # Phase 1 設定（MNIST, IID）
-│   └── afad_phase2_config.yaml     # Phase 2 設定（OrganAMNIST, Non-IID）
+│   ├── afad_phase2_config.yaml     # Phase 2 設定（OrganAMNIST, Non-IID α=0.5）
+│   └── afad_phase2_iid_config.yaml # Phase 2 設定（OrganAMNIST, IID）
 ├── results/                        # 実験結果 JSON
+├── .claude/
+│   ├── docs/research/              # Gemini / Codex 調査結果
+│   └── rules/                      # コーディング・セキュリティルール
 ├── pyproject.toml
 └── uv.lock
 ```
@@ -462,12 +553,27 @@ uv run poe all
 
 ---
 
+## ブランチ構成（開発履歴）
+
+| ブランチ | 内容 | 状態 |
+|---------|------|------|
+| `main` | 安定版（Phase 1/2 基本実験済み） | 安定 |
+| `feature/rate-conditioned-generator` | Generator を rate 別ヘッドで訓練 | 完了（Non-IID −0.35pp） |
+| `feature/prototype-anchoring` | Proto Anchoring 損失追加 | 完了（Non-IID +0.92pp）|
+| `feature/iid-kd-fix` | skip025/TempKD/LogitKD ablation | 完了（IID +0.60pp max）|
+| `feature/projection-heads` | ProjectionHead P_r: z_{eff}→z_{32} | **実験中** |
+
+---
+
 ## 参考文献
 
 - Diao, E. et al. "HeteroFL: Computation and Communication Efficient Federated Learning for Heterogeneous Clients." *ICLR 2021.*
 - Zhu, Z. et al. "Data-Free Knowledge Distillation for Heterogeneous Federated Learning." *ICML 2021.*
 - Li, T. et al. "Federated Optimization in Heterogeneous Networks." *MLSys 2020.*
 - Hinton, G. et al. "Distilling the Knowledge in a Neural Network." *NeurIPS Workshop 2015.*
+- Mirzadeh, S. I. et al. "Improved Knowledge Distillation via Teacher Assistant." *AAAI 2020.* (TAKD; 容量差 >4× で KD が有害になる根拠)
+- Tan, Y. et al. "Federated Learning from Pre-Trained Models: A Contrastive Learning Approach." *NeurIPS 2022.* (FedPCL; 射影ヘッドの federated 応用)
+- Yoon, J. et al. "FedFD: Federated Feature Distillation." *FLSys Workshop 2023.* (P_r 射影ヘッドの FedFL 応用)
 
 ---
 
