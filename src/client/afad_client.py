@@ -395,7 +395,9 @@ class AFADClient(fl.client.NumPyClient):
                     client_latent = self.model.bottleneck(features)
                     with torch.no_grad():
                         gen_target = self.generator(labels)["output"]
-                    effective_dim = max(1, int(self.latent_dim * self.model_rate))
+                    # Use proj_head's fixed effective_dim (set at init time).
+                    # self.model_rate may change via fit() config but proj_head does not.
+                    effective_dim = self.proj_head.effective_dim
                     z_eff = client_latent[:, :effective_dim]
                     proj_latent = self.proj_head(z_eff)
                     # Normalize both sides to unit scale before MSE
