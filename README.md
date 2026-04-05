@@ -165,12 +165,16 @@ Non-IID 環境では FedGen Only が最も高い精度（84.66%）を達成す�
 
 | 手法 | BEST | vs HeteroFL |
 |------|:----:|:-----------:|
-| HeteroFL Only | 83.39% | — |
-| **FedGen Only** | **86.49%** | +3.10pp ← **IID 目標** |
-| AFAD Hybrid | 76.96% | **−6.43pp** ← KD が悪化 |
-| AFAD + RateCond | 81.88% | −1.51pp |
+| HeteroFL Only | 76.39% | — |
+| AFAD Hybrid | 76.26% | **−0.13pp** ← KD が悪化 |
+| FedGen Only | 86.15% | +9.76pp ← **従来の目標** |
+| **AFAD + ProjHead** | **88.89%** | **+12.50pp** ← **目標超過** |
 
-**重要な発見**: IID 環境でも KD が大幅に悪化する（−6.43pp）。この発見が以降の研究方針を決定した。
+**重要な発見①**: IID 環境でも KD が悪化する（AFAD Hybrid = 76.26% < HeteroFL 76.39%）。この発見が以降の研究方針を決定した。
+
+**重要な発見②**: ProjectionHead で **FedGen Only（86.15%）を +2.74pp 上回る 88.89%** を達成。IID 環境ではProjectionHead が非常に有効。
+
+> **旧 IID 結果（別シード）**: HeteroFL 83.39%, FedGen 86.49%, AFAD Hybrid 76.96%, AFAD+RateCond 81.88%
 
 ### アブレーション実験（Phase 2 Non-IID ベース）
 
@@ -315,7 +319,16 @@ $$\mathcal{L}_{\text{proj}} = \gamma \cdot \text{MSE}(P_r(z_{\text{eff}}),\, G(y
 - IID 環境では全クラスが均等に現れるため、P_r が低歪みのマッピングを学習できる
 - Non-IID では少数クラスバイアスのリスクがあるが、初期改善の確認を優先
 
-**現状**: IID 実験実行中（結果は後述）。
+**結果**（OrganAMNIST, IID, 10 clients, 40 rounds）:
+
+| 手法 | BEST |
+|------|:----:|
+| HeteroFL Only | 76.39% |
+| AFAD Hybrid | 76.26% |
+| FedGen Only | 86.15% |
+| **AFAD + ProjHead** | **88.89%** |
+
+→ **FedGen Only を +2.74pp 上回り**、IID ギャップを完全に解消。
 
 ---
 
