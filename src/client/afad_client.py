@@ -385,20 +385,28 @@ class AFADClient(fl.client.NumPyClient):
 
                 # Projection Head loss: align P_r(z_eff) with generator latent
                 # (FedFD / Codex Idea 4: dimension-matched KD in 32-dim space)
+                # Fixes vs initial impl:
+                #   - gradients flow through backbone/bottleneck (no no_grad on client side)
+                #   - layer_norm on both sides prevents MSE from dominating CE loss
+                #   - gen_target only is detached (generator is frozen)
                 if self.proj_gamma > 0.0:
                     gamma = self.proj_gamma * (DECAY_RATE**glob_iter)
+                    features = self.model.backbone(images)
+                    client_latent = self.model.bottleneck(features)
                     with torch.no_grad():
-                        features = self.model.backbone(images)
-                        client_latent = self.model.bottleneck(features)
                         gen_target = self.generator(labels)["output"]
                     effective_dim = max(1, int(self.latent_dim * self.model_rate))
                     z_eff = client_latent[:, :effective_dim]
                     proj_latent = self.proj_head(z_eff)
-                    proj_loss = gamma * F.mse_loss(proj_latent, gen_target)
+                    # Normalize both sides to unit scale before MSE
+                    z_norm = F.layer_norm(proj_latent, [self.latent_dim])
+                    g_norm = F.layer_norm(gen_target, [self.latent_dim])
+                    proj_loss = gamma * F.mse_loss(z_norm, g_norm)
                     loss = loss + proj_loss
 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
+                # Clip gradients for both model and proj_head
+                torch.nn.utils.clip_grad_norm_(all_params, 1)
                 optimizer.step()
 
     def evaluate(

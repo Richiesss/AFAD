@@ -811,8 +811,9 @@ def main():
                            "rate_adaptive_temperature": True,
                            "logit_only_kd": True},
         # Projection Head: P_r: z_{eff} → z_{32} (FedFD / Codex Idea 4)
+        # proj_gamma=0.01: layer_norm済みMSEなので小さい値で十分
         "AFAD + ProjHead": {"enable_fedgen": True, "enable_heterofl": True,
-                            "proj_gamma": 1.0},
+                            "proj_gamma": 0.01},
     }
 
     for method in methods_to_run:
