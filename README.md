@@ -154,10 +154,11 @@ AFAD の改善推移（ナイーブ統合からの 4 段階改善）:
 |------|:----:|------|
 | HeteroFL Only | 65.36% | ベースライン |
 | AFAD Hybrid | 67.08% | +1.72pp vs HeteroFL |
-| AFAD + Prototype Anchoring | **68.00%** | +0.92pp vs AFAD Hybrid |
+| AFAD + Prototype Anchoring | 68.00% | +0.92pp vs AFAD Hybrid |
+| **AFAD + ProjHead** | **67.69%** | +0.61pp vs AFAD Hybrid |
 | FedGen Only | 84.66% | **目標** (pure homogeneous) |
 
-Non-IID 環境では FedGen Only が最も高い精度（84.66%）を達成する。Generator がサーバー側でクラスバランスの取れた潜在ベクトルを生成するため、データ不均質の影響を受けにくい。一方 AFAD は HeteroFL を +1.72pp 上回るが、FedGen との差は **16.66pp** 残る（構造的問題、後述）。
+Non-IID 環境では FedGen Only が最も高い精度（84.66%）を達成する。AFAD + ProjHead は 67.69% で AFAD Hybrid を +0.61pp 上回るが、IID での劇的な改善（+12.5pp）と比べると Non-IID での効果は限定的。FedGen との差は **16.97pp** 残る（構造的問題、後述）。
 
 ### Phase 2: OrganAMNIST（**IID**, 10 clients, 40 rounds）
 
@@ -329,6 +330,18 @@ $$\mathcal{L}_{\text{proj}} = \gamma \cdot \text{MSE}(P_r(z_{\text{eff}}),\, G(y
 | **AFAD + ProjHead** | **88.89%** |
 
 → **FedGen Only を +2.74pp 上回り**、IID ギャップを完全に解消。
+
+**結果**（OrganAMNIST, Non-IID α=0.5, 10 clients, 40 rounds）:
+
+| 手法 | BEST |
+|------|:----:|
+| HeteroFL Only | 65.36% |
+| AFAD Hybrid | 67.08% |
+| **AFAD + ProjHead** | **67.69%** |
+| AFAD + Proto | 68.00% |
+| FedGen Only | 84.66% |
+
+→ AFAD Hybrid を +0.61pp 上回るが、IID ほどの劇的な改善はなし。Non-IID では少数クラスバイアスにより P_r の学習が困難（構造的制約）。
 
 ---
 

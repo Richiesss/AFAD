@@ -612,6 +612,11 @@ def run_single_experiment(
                 ],
                 "env_vars": {
                     "PYTHONPATH": ":".join(p for p in sys.path if p),
+                    # WSL2 fix: uv workers fail to hardlink between /home and /tmp
+                    # (different filesystems). copy mode avoids worker startup hang.
+                    "UV_LINK_MODE": "copy",
+                    # Point uv to the existing venv so it doesn't try to recreate it
+                    "UV_PROJECT_ENVIRONMENT": str(Path(__file__).parent.parent / ".venv"),
                 },
             },
         },
