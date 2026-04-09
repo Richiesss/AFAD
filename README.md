@@ -388,17 +388,19 @@ AFAD + Proto は AFAD Hybrid を **+0.92pp**、HeteroFL Only を **+2.64pp** 上
 
 しかし FedGen Only（84.66%）との差は **16.66pp** に達する。FedGen Only が Non-IID で強い理由は、サーバーサイドの Generator がクラスバランスの取れた潜在ベクトルを生成することでクライアントのデータ偏りの影響を無効化できるためである。
 
-#### 5.3.2 新手法の比較（実験中）
+#### 5.3.2 新手法の比較
 
-| 手法 | BEST |
-|------|:----:|
-| HeteroFL Only | 65.36% |
-| AFAD Hybrid | 67.08% |
-| AFAD + Proto | 68.00% |
-| FedGen Only | 84.66% |
-| AFAD + RateCond | 実験中 |
-| AFAD + AnchorKD | 実験中 |
-| AFAD + BNAnchorKD | 実験中 |
+| 手法 | BEST | FINAL |
+|------|:----:|:-----:|
+| FedGen Only | 84.66% | — |
+| **AFAD + Proto** | **68.00%** | — |
+| **AFAD + RateCond** | **67.94%** | 67.68% |
+| AFAD Hybrid | 67.08% | — |
+| AFAD + AnchorKD | 66.97% | 66.69% |
+| AFAD + BNAnchorKD | 66.79% | 66.79% |
+| HeteroFL Only | 65.36% | — |
+
+RateCond と Proto がほぼ同等（差 0.06pp）で AFAD Hybrid を上回る。AnchorKD は HeteroFL Only を超えるが AFAD Hybrid をわずかに下回り、BNAnchorKD はさらに低い（BN 損失が過剰正則化）。FedGen との差（約 16.7pp）は依然として残る。
 
 ### 5.4 アブレーション実験
 
