@@ -145,8 +145,18 @@ AFAD の改善推移（ナイーブ統合からの 4 段階改善）:
 | HeteroFL Only | 99.19% | 99.19% | 474s |
 | FedGen Only | 99.60% | 99.57% | 579s |
 | **AFAD Hybrid** | **99.35%** | **99.29%** | **325s** |
+| AFAD + Proto | — | — | — |
+| **AFAD + RateCond** | **93.56%** | **93.52%** | ~1600s |
+| AFAD + AnchorKD | 92.97% | 92.82% | ~1600s |
+| AFAD + BNAnchorKD | 92.61% | 92.43% | ~1600s |
 
 AFAD は HeteroFL と FedGen の中間に位置し、単独では達成できない設定（異なるアーキテクチャ × 異なる幅）をカバーしながら高い精度を維持する。また実行時間は 3 手法中最短。
+
+新手法（RateCond / AnchorKD）については、MNIST IID では AFAD Hybrid より低い精度となった。これは MNIST が IID・単純なタスクであるため、追加の正則化（Generator rate-aware 化・教師蒸留）がノイズとして働く可能性がある。本来の評価環境は Non-IID（Phase 2）。
+
+**AnchorKD の傾向**:
+- Round 1〜5 の初期収束は AnchorKD 系が RateCond より速い（フルレート教師による早期誘導が有効）
+- 最終精度は RateCond > AnchorKD > BNAnchorKD（BN 損失は MNIST IID では過剰正則化）
 
 ### Phase 2: OrganAMNIST（Non-IID α=0.5, 10 clients, 40 rounds）
 
