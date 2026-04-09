@@ -80,6 +80,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         enable_heterofl: bool = True,
         num_rounds: int = 20,
         num_classes: int = 10,
+        anchor_kd_for_subrate: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -89,6 +90,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self.enable_heterofl = enable_heterofl
         self.num_rounds = num_rounds
         self.num_classes = num_classes
+        self.anchor_kd_for_subrate = anchor_kd_for_subrate
 
         # Per-family global models (rate=1.0 params as numpy arrays)
         self.family_global_models: dict[str, list[np.ndarray]] = {}
@@ -217,6 +219,16 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         gen_params = [val.cpu().numpy() for val in self.generator.state_dict().values()]
         return pickle.dumps(gen_params)
 
+    def _serialize_anchor_params(self, family: str) -> bytes | None:
+        """Serialize the rate=1.0 family global model for anchor KD distribution.
+
+        Returns the full-rate params for the given family as pickled numpy arrays,
+        to be sent to sub-rate clients of that family as the frozen teacher.
+        """
+        if family not in self.family_global_models:
+            return None
+        return pickle.dumps(self.family_global_models[family])
+
     # ─── Flower overrides ─────────────────────────────────────────
 
     def initialize_parameters(
@@ -286,6 +298,16 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             # Send generator params to clients (AFAD/FedGen modes)
             if gen_params_bytes is not None:
                 new_config["generator_params"] = gen_params_bytes
+
+            # Send anchor params to sub-rate clients for AnchorKD
+            if (
+                self.anchor_kd_for_subrate
+                and family
+                and self.client_model_rates.get(cid, 1.0) < 1.0
+            ):
+                anchor_bytes = self._serialize_anchor_params(family)
+                if anchor_bytes is not None:
+                    new_config["anchor_params"] = anchor_bytes
 
             # Determine model parameters to send
             if self.enable_heterofl and family and family in self.family_global_models:

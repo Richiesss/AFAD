@@ -221,18 +221,57 @@ $\gamma = 1.0$（proto_gamma）、$\lambda = \text{DECAY\_RATE}^{\text{round}}$ 
 
 ---
 
+## AFAD + AnchorKD（フルレート凍結教師による sub-rate KD）
+
+### 動機
+
+AFAD + Proto の FedGen Generator は rate=1.0/0.5/0.25 全てを教師にすることで sub-rate の潜在空間を Generator に反映させる。一方 **AnchorKD** は別のアプローチをとる。**フルレートの集約済みグローバルモデル（凍結）を教師**として使い、各ラウンドで sub-rate クライアントのロジット・bottleneck 出力を直接整合させる。
+
+### 手法
+
+$$\mathcal{L} = \mathcal{L}_{\text{CE}} + \mathcal{L}_{\text{FedGen}} + \mathcal{L}_{\text{AnchorKD}}$$
+
+**AnchorKD 損失**（sub-rate クライアントのみ）:
+
+$$\mathcal{L}_{\text{AnchorKD}} = \gamma_{\text{logit}} \cdot T^2 \cdot \text{KL}\!\left(\frac{f_s(x)}{T} \,\Big\|\, \frac{f_a(x)}{T}\right) + \gamma_{\text{BN}} \cdot \text{MSE}\!\left(\text{LN}(z_s^{1:ed}),\, \text{LN}(z_a^{1:ed})\right)$$
+
+- $f_a$: rate=1.0 凍結アンカーモデル（サーバーから毎ラウンド配布）
+- $T = 1 / \text{model\_rate}$（rate=0.5 → T=2, rate=0.25 → T=4）
+- $ed = \lfloor \text{latent\_dim} \times \text{model\_rate} \rfloor$（sub-rate bottleneck の有効次元）
+- LN = LayerNorm（スケール差異を吸収）
+
+### バリアント
+
+| 手法 | anchor_kd_gamma | bottleneck_gamma | 説明 |
+|------|:---:|:---:|------|
+| **AFAD + AnchorKD** | 1.0 | 0 | ロジットレベル KD のみ |
+| **AFAD + BNAnchorKD** | 1.0 | 1.0 | ロジット + bottleneck レベル |
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|----------|---------|
+| `src/server/strategy/afad_strategy.py` | `anchor_kd_for_subrate` フラグ + `_serialize_anchor_params()` — rate=1.0 family モデルを sub-rate クライアントへ配布 |
+| `src/client/afad_client.py` | `set_anchor_parameters()` + AnchorKD 損失計算（logit-level + BN-level） |
+| `scripts/run_comparison.py` | `"AFAD + AnchorKD"`, `"AFAD + BNAnchorKD"` の 2 手法追加 |
+
+> **Proto との違い**: Proto は Generator の潜在空間にクライアントの bottleneck を引き寄せる（生成側を基準）。AnchorKD はフルレートの実モデル出力を教師にする（識別側を基準）。両者は相補的であり、組み合わせも可能。
+
+---
+
 ## 各手法の比較
 
-| | HeteroFL Only | FedGen Only | AFAD Hybrid | AFAD + Proto |
-|---|:---:|:---:|:---:|:---:|
-| 計算能力の異種性 (rate 可変) | ○ | × | **○** | **○** |
-| アーキテクチャ異種性 (CNN ↔ ViT) | × | ○ | **○** | **○** |
-| sub-rate クライアントへの知識補完 | × | △ | ○ | **◎** |
-| Non-IID 耐性 | 中 | 高 | 中 | 中〜高 |
-| 集約方式 | count-based | FedAvg | count-based | count-based |
-| クライアント損失 | CE のみ | CE + KD (α/β=10 固定) | CE + KD (α/β=0.5/rate) | CE + KD + Proto anchoring |
-| サーバー Generator 訓練対象 | なし | rate=1.0 のみ | rate=1.0 のみ | **rate=1.0/0.5/0.25 全て** |
-| プロトタイプアンカリング | なし | なし | なし | **あり（proto_gamma=1.0）** |
+| | HeteroFL Only | FedGen Only | AFAD Hybrid | AFAD + Proto | AFAD + AnchorKD | AFAD + BNAnchorKD |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| 計算能力の異種性 (rate 可変) | ○ | × | **○** | **○** | **○** | **○** |
+| アーキテクチャ異種性 (CNN ↔ ViT) | × | ○ | **○** | **○** | **○** | **○** |
+| sub-rate クライアントへの知識補完 | × | △ | ○ | **◎** | **◎** | **◎** |
+| Non-IID 耐性 | 中 | 高 | 中 | 中〜高 | 中〜高 | 中〜高 |
+| 集約方式 | count-based | FedAvg | count-based | count-based | count-based | count-based |
+| クライアント損失 | CE のみ | CE + KD (α/β=10 固定) | CE + KD (α/β=0.5/rate) | CE + KD + Proto anchoring | CE + KD + AnchorKD (logit) | CE + KD + AnchorKD (logit + BN) |
+| サーバー Generator 訓練対象 | なし | rate=1.0 のみ | rate=1.0 のみ | **rate=1.0/0.5/0.25 全て** | rate=1.0 のみ | rate=1.0 のみ |
+| プロトタイプアンカリング | なし | なし | なし | **あり（proto_gamma=1.0）** | なし | なし |
+| AnchorKD（フルレート教師） | なし | なし | なし | なし | **logit-level (γ=1.0)** | **logit+BN-level (γ=1.0)** |
 
 ---
 
@@ -265,6 +304,9 @@ Clients
 └── AFADClient     — CE + KD（α=β=0.5/rate）/ 幅スケール / HeteroFL 前提
                      shape-aware set_parameters / FedProx 対応
                      Prototype Anchoring オプション対応（proto_gamma > 0 時に有効）
+                     AnchorKD オプション対応（anchor_kd_gamma / bottleneck_gamma > 0 時に有効）
+                       - logit-level: T²·KL(student(x)/T ‖ anchor(x)/T), T=1/rate
+                       - BN-level: MSE(LN(student_bn[:,:ed]), LN(anchor_bn[:,:ed]))
 ```
 
 ---

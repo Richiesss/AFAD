@@ -251,6 +251,8 @@ def afad_client_fn_builder(
     cid_to_rate: dict[str, float],
     proto_gamma: float = 0.0,
     rate_conditioned: bool = False,
+    anchor_kd_gamma: float = 0.0,
+    bottleneck_gamma: float = 0.0,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -292,6 +294,8 @@ def afad_client_fn_builder(
             generative_alpha=kd_scale,
             generative_beta=kd_scale,
             proto_gamma=proto_gamma,
+            anchor_kd_gamma=anchor_kd_gamma,
+            bottleneck_gamma=bottleneck_gamma,
         ).to_client()
 
     return client_fn
@@ -319,6 +323,7 @@ def _build_strategy(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     rate_conditioned: bool = False,
+    anchor_kd_for_subrate: bool = False,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
@@ -398,6 +403,7 @@ def _build_strategy(
         enable_heterofl=enable_heterofl,
         num_rounds=num_rounds,
         num_classes=num_classes,
+        anchor_kd_for_subrate=anchor_kd_for_subrate,
         min_fit_clients=num_clients,
         min_available_clients=num_clients,
         fraction_fit=1.0,
@@ -432,6 +438,9 @@ def run_single_experiment(
     fedgen_cfg: dict | None = None,
     proto_gamma: float = 0.0,
     rate_conditioned: bool = False,
+    anchor_kd_for_subrate: bool = False,
+    anchor_kd_gamma: float = 0.0,
+    bottleneck_gamma: float = 0.0,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -462,6 +471,7 @@ def run_single_experiment(
         training_cfg=training_cfg,
         fedgen_cfg=fedgen_cfg,
         rate_conditioned=rate_conditioned,
+        anchor_kd_for_subrate=anchor_kd_for_subrate,
     )
 
     # Build client_fn based on experiment mode
@@ -477,6 +487,8 @@ def run_single_experiment(
             cid_to_rate,
             proto_gamma=proto_gamma,
             rate_conditioned=rate_conditioned,
+            anchor_kd_gamma=anchor_kd_gamma,
+            bottleneck_gamma=bottleneck_gamma,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -695,7 +707,11 @@ def main():
         logger.info(f"Loaded existing results from {args.load}: {list(results.keys())}")
 
     # Determine which methods to run
-    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Proto", "AFAD + RateCond"]
+    all_methods = [
+        "HeteroFL Only", "FedGen Only", "AFAD Hybrid",
+        "AFAD + Proto", "AFAD + RateCond",
+        "AFAD + AnchorKD", "AFAD + BNAnchorKD",
+    ]
     if args.methods:
         methods_to_run = [m.strip() for m in args.methods.split(",")]
     else:
@@ -708,6 +724,16 @@ def main():
         "AFAD Hybrid":   {"enable_fedgen": True,  "enable_heterofl": True},
         "AFAD + Proto":     {"enable_fedgen": True,  "enable_heterofl": True,  "proto_gamma": 1.0},
         "AFAD + RateCond":  {"enable_fedgen": True,  "enable_heterofl": True,  "rate_conditioned": True},
+        # AnchorKD: full-rate frozen teacher for sub-rate clients (logit-level KD only)
+        "AFAD + AnchorKD":  {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "anchor_kd_for_subrate": True, "anchor_kd_gamma": 1.0,
+        },
+        # BN-AnchorKD: logit-level KD + bottleneck-level MSE alignment
+        "AFAD + BNAnchorKD": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "anchor_kd_for_subrate": True, "anchor_kd_gamma": 1.0, "bottleneck_gamma": 1.0,
+        },
     }
 
     for method in methods_to_run:

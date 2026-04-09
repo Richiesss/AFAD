@@ -3,11 +3,16 @@
 Combines:
 - HeteroFL: Shape-aware set_parameters for width-scaled sub-models
 - FedGen: Client-side regularization via generator latent space
+- AnchorKD (optional): Full-rate frozen anchor teacher for sub-rate clients
 
-Training loss:
+Training loss (base):
   L = CE(model(x), y)                                       # predictive
     + alpha * CE(classifier(G(y_rand)), y_rand)              # teacher
     + beta  * KL(model(x) || classifier(G(y_real)))          # latent matching
+
+AnchorKD additions (sub-rate clients only, anchor_model != None):
+  + gamma * T^2 * KL(student(x)/T || anchor(x)/T)           # logit-level KD
+  + bn_gamma * MSE(LN(student_bn[:,:ed]), LN(anchor_bn[:,:ed]))  # bottleneck-level
 
 where alpha=10, beta=10, decaying by 0.98/round.
 """
@@ -65,6 +70,8 @@ class AFADClient(fl.client.NumPyClient):
         generative_alpha: Teacher loss weight.
         generative_beta: Latent matching loss weight.
         gen_batch_size: Batch size for generated samples.
+        anchor_kd_gamma: Logit-level AnchorKD weight (sub-rate only, 0=disabled).
+        bottleneck_gamma: Bottleneck-level MSE weight (sub-rate only, 0=disabled).
     """
 
     def __init__(
@@ -87,6 +94,8 @@ class AFADClient(fl.client.NumPyClient):
         generative_beta: float = DEFAULT_GENERATIVE_BETA,
         gen_batch_size: int = 32,
         proto_gamma: float = 0.0,
+        anchor_kd_gamma: float = 0.0,
+        bottleneck_gamma: float = 0.0,
     ):
         self.cid = cid
         self.model = model
@@ -108,6 +117,10 @@ class AFADClient(fl.client.NumPyClient):
         self.generative_beta = generative_beta
         self.gen_batch_size = gen_batch_size
         self.proto_gamma = proto_gamma
+        self.anchor_kd_gamma = anchor_kd_gamma
+        self.bottleneck_gamma = bottleneck_gamma
+        # Anchor model for sub-rate KD (received from server each round)
+        self.anchor_model: FedGenModelWrapper | None = None
 
         # Precompute label counts and available labels
         self.label_counts = self._compute_label_counts()
@@ -177,6 +190,32 @@ class AFADClient(fl.client.NumPyClient):
             state_dict[key] = torch.tensor(param)
         self.generator.load_state_dict(state_dict, strict=False)
 
+    def set_anchor_parameters(self, parameters: list[np.ndarray]) -> None:
+        """Set anchor model parameters (rate=1.0 family global model).
+
+        The anchor model is a frozen copy of the full-rate family model used
+        as a teacher for sub-rate clients in AnchorKD.
+        """
+        if self.anchor_model is None:
+            # Lazily create anchor model with same architecture at rate=1.0
+            from src.models.registry import ModelRegistry
+            base = ModelRegistry.create_model(
+                self.model_name, num_classes=self.num_classes, model_rate=1.0
+            )
+            self.anchor_model = FedGenModelWrapper(
+                base, latent_dim=self.model.latent_dim, num_classes=self.num_classes
+            )
+            self.anchor_model.to(self.device)
+
+        anchor_keys = list(self.anchor_model.state_dict().keys())
+        state_dict = OrderedDict()
+        for key, param in zip(anchor_keys, parameters):
+            state_dict[key] = torch.tensor(param)
+        self.anchor_model.load_state_dict(state_dict, strict=False)
+        self.anchor_model.eval()
+        for p in self.anchor_model.parameters():
+            p.requires_grad = False
+
     def fit(
         self, parameters: list[np.ndarray], config: dict
     ) -> tuple[list[np.ndarray], int, dict]:
@@ -209,6 +248,12 @@ class AFADClient(fl.client.NumPyClient):
             gen_params = pickle.loads(gen_params_bytes)  # noqa: S301
             self.set_generator_parameters(gen_params)
 
+        # Update anchor model if params provided (sub-rate AnchorKD)
+        anchor_params_bytes = config.get("anchor_params", None)
+        if isinstance(anchor_params_bytes, bytes):
+            anchor_params = pickle.loads(anchor_params_bytes)  # noqa: S301
+            self.set_anchor_parameters(anchor_params)
+
         glob_iter = config.get("round", 0)
         regularization = config.get("regularization", glob_iter > 0)
 
@@ -224,6 +269,7 @@ class AFADClient(fl.client.NumPyClient):
             regularization=regularization,
             fedprox_mu=fedprox_mu,
             global_params=global_params,
+            anchor_model=self.anchor_model,
         )
 
         # Serialize label_counts as comma-separated string for Flower Scalar
@@ -247,8 +293,9 @@ class AFADClient(fl.client.NumPyClient):
         regularization: bool = True,
         fedprox_mu: float = 0.0,
         global_params: list[torch.Tensor] | None = None,
+        anchor_model: FedGenModelWrapper | None = None,
     ) -> None:
-        """Local training with FedGen regularization and optional FedProx.
+        """Local training with FedGen regularization and optional FedProx/AnchorKD.
 
         FedGen regularization (two terms from original paper):
         1. Teacher loss: CE on generated latents with random labels
@@ -256,6 +303,11 @@ class AFADClient(fl.client.NumPyClient):
         Both terms decay with 0.98^round, disabled after EARLY_STOP_EPOCH epochs.
 
         FedProx: proximal term (mu/2)||w - w_global||^2 for Non-IID stability.
+
+        AnchorKD (sub-rate clients, anchor_model != None):
+        - Logit-level: T^2 * KL(student(x)/T || anchor(x)/T), T=1/model_rate
+        - Bottleneck-level: MSE(LN(student_bn[:,:ed]), LN(anchor_bn[:,:ed]))
+          where ed = int(latent_dim * model_rate), LN = LayerNorm
         """
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.SGD(
@@ -285,6 +337,43 @@ class AFADClient(fl.client.NumPyClient):
                     ):
                         prox_term += (local_p - global_p.to(self.device)).pow(2).sum()
                     loss = loss + (fedprox_mu / 2.0) * prox_term
+
+                # AnchorKD: full-rate frozen model as teacher (sub-rate only)
+                anchor_active = (
+                    anchor_model is not None
+                    and self.model_rate < 1.0
+                    and (self.anchor_kd_gamma > 0.0 or self.bottleneck_gamma > 0.0)
+                )
+                if anchor_active:
+                    T = 1.0 / self.model_rate  # temperature: 2.0 for rate=0.5, 4.0 for 0.25
+                    with torch.no_grad():
+                        anchor_logits = anchor_model(images)
+
+                    # Logit-level KD: KL divergence with temperature scaling
+                    if self.anchor_kd_gamma > 0.0:
+                        anchor_p = F.softmax(anchor_logits / T, dim=1).detach()
+                        student_logp = F.log_softmax(logits / T, dim=1)
+                        anchor_kd_loss = (
+                            self.anchor_kd_gamma
+                            * T**2
+                            * F.kl_div(student_logp, anchor_p, reduction="batchmean")
+                        )
+                        loss = loss + anchor_kd_loss
+
+                    # Bottleneck-level KD: MSE on LayerNorm-aligned features
+                    if self.bottleneck_gamma > 0.0:
+                        latent_dim = self.model.latent_dim
+                        ed = max(1, int(latent_dim * self.model_rate))
+                        with torch.no_grad():
+                            anchor_feats = anchor_model.backbone(images)
+                            anchor_bn = anchor_model.bottleneck(anchor_feats)
+                        student_feats = self.model.backbone(images)
+                        student_bn = self.model.bottleneck(student_feats)
+                        # LayerNorm before MSE to handle scale differences
+                        s_norm = F.layer_norm(student_bn[:, :ed], [ed])
+                        a_norm = F.layer_norm(anchor_bn[:, :ed].detach(), [ed])
+                        bn_loss = self.bottleneck_gamma * F.mse_loss(s_norm, a_norm)
+                        loss = loss + bn_loss
 
                 # FedGen regularization (after first round, before early stop)
                 if regularization and epoch < EARLY_STOP_EPOCH:
