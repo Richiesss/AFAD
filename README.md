@@ -10,7 +10,7 @@
 
 本研究では **AFAD（Adaptive Federated Architecture Distribution）** を提案する。AFAD は両手法を統合し、共有 32 次元潜在空間と Generator を介してアーキテクチャをまたいだ知識共有を実現しながら、幅スケーリングで計算能力の異種性にも対応する。単純な統合（ナイーブ統合）から 4 段階の改善を経て、さらに **Prototype Anchoring**・**Rate-conditioned Generator**・**AnchorKD** という 3 種の拡張手法を提案する。
 
-Non-IID 環境（OrganAMNIST, α=0.5）において、AFAD + Proto は HeteroFL Only を **+2.64pp** 上回る。また、sub-rate クライアントの潜在空間不整合という構造的問題を特定し、その解決策を系統的に検証する。
+Non-IID 環境（OrganAMNIST, α=0.5）において、AFAD + Proto は HeteroFL Only を **+2.64pp** 上回る。また、sub-rate クライアントの潜在空間不整合という構造的問題を特定し、**FedAvg 集約・サーバー側蒸留・Nested Bottleneck** という 3 種のギャップ解消アプローチを体系的に検証する。全アプローチがベースラインを下回った実験結果を通じて、FedGen との性能差が単一手法では解消できない複合的な構造問題であることを示す。
 
 ---
 
@@ -31,6 +31,8 @@ Non-IID 環境（OrganAMNIST, α=0.5）において、AFAD + Proto は HeteroFL 
    - 5.1 [実験設定](#51-実験設定)
    - 5.2 [Phase 1: MNIST IID](#52-phase-1-mnist-iid)
    - 5.3 [Phase 2: OrganAMNIST Non-IID](#53-phase-2-organamnist-non-iid)
+     - 5.3.1 [全手法比較](#531-全手法比較)
+     - 5.3.2 [FedGen ギャップ解消実験](#532-fedgen-ギャップ解消実験)
    - 5.4 [アブレーション実験](#54-アブレーション実験)
 6. [分析・考察](#6-分析考察)
 7. [各手法の比較表](#7-各手法の比較表)
@@ -375,30 +377,55 @@ AnchorKD 系は序盤（Round 3〜4）でフルレート教師による早期誘
 
 > Dirichlet 分割（α=0.5）による Non-IID 環境。10 clients、40 rounds、seed=42 の単一試行。
 
-#### 5.3.1 既存手法との比較
+#### 5.3.1 全手法比較
 
-| 手法 | BEST |
-|------|:----:|
-| HeteroFL Only | 65.36% |
-| AFAD Hybrid | 67.08% |
-| **AFAD + Proto** | **68.00%** |
-| FedGen Only | 84.66% |
+| 手法 | BEST | Final |
+|------|:----:|:-----:|
+| HeteroFL Only | 65.36% | 64.90% |
+| AFAD Hybrid | 67.84% | 67.73% |
+| AFAD + AnchorKD | 66.97% | 66.69% |
+| AFAD + BNAnchorKD | 66.79% | 66.79% |
+| AFAD + RateCond | 67.94% | 67.68% |
+| **AFAD + Proto** | **68.00%** | **67.39%** |
+| FedGen Only | 84.66% | 84.62% |
 
-AFAD + Proto は AFAD Hybrid を **+0.92pp**、HeteroFL Only を **+2.64pp** 上回る。
+AFAD + Proto は AFAD Hybrid を **+0.16pp**、HeteroFL Only を **+2.64pp** 上回り、AFAD 系で最良の結果を示す。
 
 しかし FedGen Only（84.66%）との差は **16.66pp** に達する。FedGen Only が Non-IID で強い理由は、サーバーサイドの Generator がクラスバランスの取れた潜在ベクトルを生成することでクライアントのデータ偏りの影響を無効化できるためである。
 
-#### 5.3.2 新手法の比較（実験中）
+#### 5.3.2 FedGen ギャップ解消実験
 
-| 手法 | BEST |
-|------|:----:|
-| HeteroFL Only | 65.36% |
-| AFAD Hybrid | 67.08% |
-| AFAD + Proto | 68.00% |
-| FedGen Only | 84.66% |
-| AFAD + RateCond | 実験中 |
-| AFAD + AnchorKD | 実験中 |
-| AFAD + BNAnchorKD | 実験中 |
+16.66pp のギャップを縮めるために 3 つのアプローチを体系的に検討した。各手法はそれぞれ独立したブランチで実装・実験した。
+
+**Case C: FedAvg 集約（feature/fedavg-aggregation）**
+
+HeteroFL の count-based 集約を、FedGen と同じサンプル数重み付けの FedAvg に置き換える。Sub-rate パラメータは対応するスライスにのみ加算する shape-aware な実装とした。
+
+**Case A: Server-side Distillation（feature/server-side-distillation）**
+
+集約後、サーバー上で Generator を用いてクラスバランスの取れた潜在ベクトルを生成し、各 family グローバルモデルを追加学習（20 steps, Adam, lr=1e-4）。Non-IID によるデータ偏りをサーバー側で補正することを狙う。
+
+**Case B: Nested Bottleneck（feature/nested-bottleneck）**
+
+Sub-rate クライアントは bottleneck weight の最初の `int(32 × rate)` 行のみを所有し、階層的な共有部分空間を形成する。rate=0.5 クライアントは 16 次元、rate=0.25 クライアントは 8 次元の有効潜在空間を保持する。
+
+**実験結果**
+
+| 手法 | BEST | Final | vs AFAD Hybrid |
+|------|:----:|:-----:|:--------------:|
+| AFAD Hybrid（ベースライン） | 67.84% | 67.73% | — |
+| AFAD + ServerDistill (Case A) | 67.14% | 66.63% | **−0.70pp** |
+| AFAD + NestedBN (Case B) | 62.53% | 60.97% | **−4.76pp** |
+| AFAD + FedAvg (Case C) | 59.35% | 58.53% | **−8.20pp** |
+| FedGen Only（上限） | 84.66% | 84.62% | +16.82pp |
+
+**結論**: 3 手法ともベースラインを下回る結果となり、ギャップの解消には至らなかった。
+
+- **Case C（FedAvg 集約）**: HeteroFL の count-based 集約はサブレートモデル専用に設計されており、単純なサンプル重み付けは構造的不整合を生む（−8.20pp）
+- **Case A（Server Distillation）**: Generator がクラスバランス出力に過学習（loss→0.0000）し、Non-IID で形成された局所特化パターンを上書きしてしまう（−0.70pp）
+- **Case B（Nested Bottleneck）**: 階層的制約が学習を阻害し、特に early rounds での収束が遅れる（−4.76pp）
+
+FedGen Only との **16.66pp ギャップは付加的な手法では解消できない構造的問題**であることが確認された。根本解決には、HeteroFL の width-scaling 制約を緩和しつつ FedGen の Non-IID 耐性を活かす、より抜本的なアーキテクチャ変更が必要と考えられる。
 
 ### 5.4 アブレーション実験
 
@@ -408,8 +435,11 @@ Phase 2（Non-IID）をベースに実施。
 |------|---------|------|------|
 | **Exp A** | FedProx 無効化（μ=0.01 → 0） | −0.23pp | FedProx は Non-IID 安定性に寄与（競合せず） |
 | **Exp C** | KD を rate=1.0 のみ・α=10 | +0.32pp（Round 26 時点）→ 不安定 | KD 係数増加は根本解決にならない |
+| **Case A** | Server-side Distillation (steps=20) | −0.70pp | Generator 過学習が Non-IID 局所特化を破壊 |
+| **Case B** | Nested Bottleneck (8/16 dim) | −4.76pp | 階層的制約が学習を阻害 |
+| **Case C** | FedAvg 集約（shape-aware） | −8.20pp | HeteroFL count-based 集約の合理性を逆説的に確認 |
 
-**結論**: AFAD vs FedGen のギャップは構造的問題。Generator が rate=1.0 の潜在空間に特化しているため、sub-rate クライアントは KD 信号を適切に活用できない。単純なハイパーパラメータ調整では解消できない。
+**結論**: AFAD vs FedGen のギャップは構造的問題。Generator が rate=1.0 の潜在空間に特化しているため、sub-rate クライアントは KD 信号を適切に活用できない。単純なハイパーパラメータ調整・集約方式変更・潜在空間制約のいずれも根本解決にならない。
 
 ---
 
@@ -428,19 +458,25 @@ Non-IID 環境での FedGen（84.66%）と AFAD + Proto（68.00%）の 16.66pp �
 
 1. **潜在空間の不整合**: Generator は rate=1.0 の bottleneck に最適化されており、rate=0.5/0.25 のクライアントの bottleneck 出力とは異なる分布を持つ。KD 信号が「ノイズ」として働く。
 
-2. **集約方式の違い**: FedGen は FedAvg（サンプル数重み）を使用し、Non-IID 下でも比較的安定した集約ができる。AFAD は count-based 集約（HeteroFL 由来）を使用しており、Non-IID 下での挙動が異なる。
+2. **集約方式の非対称性**: FedGen は FedAvg（サンプル数重み）を使用し、Non-IID 下でも比較的安定した集約ができる。AFAD は count-based 集約（HeteroFL 由来）を使用しており、Non-IID 下での挙動が異なる。**ただし、Case C の実験（FedAvg に切り替え）でむしろ精度が低下（−8.20pp）したことから、HeteroFL の count-based 集約はサブレートモデルへの適切なパラメータ分配に不可欠であることが示された。**
 
-3. **FedGen の本質的な Non-IID 耐性**: FedGen の Generator はサーバー側でクラスバランスの取れたデータを生成するため、クライアントのデータ偏りを補正できる。AFAD の HeteroFL 集約はこの恩恵を完全には受けられない。
+3. **FedGen の本質的な Non-IID 耐性**: FedGen の Generator はサーバー側でクラスバランスの取れたデータを生成するため、クライアントのデータ偏りを補正できる。AFAD の HeteroFL 集約はこの恩恵を完全には受けられない。**Case A の実験（サーバー側蒸留）では Generator 過学習（loss→0.0000）が Non-IID の局所特化を破壊した。**
 
-### 6.3 各拡張手法の位置づけ
+**ギャップ解消実験の総括**: 3 つの解消アプローチ（FedAvg 集約・Server Distillation・Nested Bottleneck）を検証したが、いずれもベースライン以下に留まった。これはギャップが単一の要因ではなく、「幅スケーリング × アーキテクチャ混在 × Non-IID」という 3 要素の複合的な相互作用に起因することを示唆する。根本的な解決には、HeteroFL の構造制約を保ちながら FedGen の Generator を sub-rate 分布に適応させる新たなアーキテクチャ設計が必要である。
 
-| 手法 | アプローチの方向 | 対象問題 |
-|------|---------------|---------|
-| **AFAD + Proto** | Generator 側：sub-rate 潜在空間を Generator に反映 + クライアント側アンカリング | 潜在空間不整合 |
-| **AFAD + RateCond** | Generator 側：rate を明示的な条件として生成 | 潜在空間不整合（より直接的） |
-| **AFAD + AnchorKD** | クライアント側：フルレートモデルを識別教師として KD | sub-rate 容量不足の補完 |
+### 6.3 各手法の位置づけと知見
 
-Proto と AnchorKD は相補的であり、「生成側の整合」と「識別側の整合」を同時に行う組み合わせが有望な次のステップである。
+| 手法 | アプローチの方向 | 対象問題 | Phase 2 BEST | 評価 |
+|------|---------------|---------|:------------:|:----:|
+| **AFAD + Proto** | Generator 側＋クライアント側の二重アンカリング | 潜在空間不整合 | **68.00%** | ✓ AFAD 系最良 |
+| **AFAD + RateCond** | Generator を rate 条件付きに拡張 | 潜在空間不整合（直接的） | 67.94% | △ 僅差 |
+| **AFAD + AnchorKD** | 凍結フルレートモデルを教師として KD | sub-rate 容量不足 | 66.97% | △ 限定的改善 |
+| **AFAD + BNAnchorKD** | AnchorKD + BN 特徴レベル整合 | sub-rate 容量不足 | 66.79% | △ 限定的改善 |
+| **AFAD + ServerDistill** | サーバー側クラスバランス蒸留 | Non-IID データ偏り | 67.14% | × Generator 過学習 |
+| **AFAD + NestedBN** | 階層的潜在部分空間の共有 | 潜在空間構造化 | 62.53% | × 学習阻害 |
+| **AFAD + FedAvg** | FedAvg 集約への切り替え | 集約安定性 | 59.35% | × 構造的不適合 |
+
+Proto と RateCond は「生成側の整合」を、AnchorKD は「識別側の整合」を担う。両者を組み合わせた手法が今後の有望な方向と考えられる。
 
 ### 6.4 MNIST IID における新手法の低迷
 
@@ -454,6 +490,23 @@ Non-IID 環境では逆に潜在空間整合が重要になるため、Phase 2 �
 ---
 
 ## 7. 各手法の比較表
+
+### 7.1 Phase 2 精度サマリー（OrganAMNIST Non-IID, 40 rounds）
+
+| 手法 | BEST | Final | vs Hybrid |
+|------|:----:|:-----:|:---------:|
+| HeteroFL Only | 65.36% | 64.90% | −2.48pp |
+| AFAD Hybrid | 67.84% | 67.73% | — |
+| AFAD + AnchorKD | 66.97% | 66.69% | −0.87pp |
+| AFAD + BNAnchorKD | 66.79% | 66.79% | −1.05pp |
+| AFAD + ServerDistill | 67.14% | 66.63% | −0.70pp |
+| AFAD + RateCond | 67.94% | 67.68% | +0.10pp |
+| **AFAD + Proto** | **68.00%** | **67.39%** | **+0.16pp** |
+| AFAD + NestedBN | 62.53% | 60.97% | −4.76pp |
+| AFAD + FedAvg | 59.35% | 58.53% | −8.20pp |
+| FedGen Only | 84.66% | 84.62% | +16.82pp |
+
+### 7.2 手法特性比較
 
 | | HeteroFL Only | FedGen Only | AFAD Hybrid | AFAD + Proto | AFAD + RateCond | AFAD + AnchorKD | AFAD + BNAnchorKD |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
