@@ -34,12 +34,14 @@ class FedGenGenerator(nn.Module):
         num_classes: int = 10,
         hidden_dim: int = 256,
         latent_dim: int = 32,
+        normalize_output: bool = False,
     ):
         super().__init__()
         self.noise_dim = noise_dim
         self.num_classes = num_classes
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.normalize_output = normalize_output
 
         input_dim = noise_dim + num_classes
 
@@ -80,6 +82,8 @@ class FedGenGenerator(nn.Module):
         for layer in self.fc_layers:
             z = layer(z)
         z = self.representation_layer(z)
+        if self.normalize_output:
+            z = F.normalize(z, p=2, dim=-1)
 
         return {"output": z, "eps": eps}
 

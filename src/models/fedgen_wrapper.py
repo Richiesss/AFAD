@@ -11,6 +11,7 @@ latent_dim and the generator targets this layer.
 """
 
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _find_classifier_info(model: nn.Module) -> tuple[str, int, nn.Linear]:
@@ -90,9 +91,11 @@ class FedGenModelWrapper(nn.Module):
         model: nn.Module,
         latent_dim: int = 32,
         num_classes: int = 10,
+        normalize_latent: bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
+        self.normalize_latent = normalize_latent
 
         # Detect and remove the original classifier
         attr_path, feature_dim, _original = _find_classifier_info(model)
@@ -107,16 +110,22 @@ class FedGenModelWrapper(nn.Module):
         self.bottleneck = nn.Linear(feature_dim, latent_dim)
         self.classifier = nn.Linear(latent_dim, num_classes)
 
+    def _normalize(self, z):
+        """L2-normalize latent vector if normalize_latent=True."""
+        if self.normalize_latent:
+            return F.normalize(z, p=2, dim=-1)
+        return z
+
     def forward(self, x):
-        """Normal forward: backbone → bottleneck → classifier."""
+        """Normal forward: backbone → bottleneck → [normalize] → classifier."""
         features = self.backbone(x)
-        latent = self.bottleneck(features)
+        latent = self._normalize(self.bottleneck(features))
         return self.classifier(latent)
 
     def forward_from_latent(self, z):
-        """Forward from generator latent output: z → classifier.
+        """Forward from generator latent output: [normalize] z → classifier.
 
-        This is equivalent to the original FedGen's
-        model(z, start_layer_idx=-1) which runs only the last layer.
+        Applies the same normalization as forward() so that generator outputs
+        and bottleneck outputs live in the same space.
         """
-        return self.classifier(z)
+        return self.classifier(self._normalize(z))

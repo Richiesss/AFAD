@@ -140,6 +140,7 @@ def build_plain_model_factories(
 def build_wrapped_model_factories(
     family_model_names: dict[str, str],
     latent_dim: int = LATENT_DIM,
+    normalize_latent: bool = False,
 ) -> dict[str, callable]:
     """Build factories that create FedGenModelWrapper-wrapped models.
 
@@ -149,11 +150,12 @@ def build_wrapped_model_factories(
     factories = {}
     for _family, name in family_model_names.items():
         if name not in factories:
-            factories[name] = lambda num_classes=10, _n=name, _ld=latent_dim: (
+            factories[name] = lambda num_classes=10, _n=name, _ld=latent_dim, _nl=normalize_latent: (
                 FedGenModelWrapper(
                     ModelRegistry.create_model(_n, num_classes=num_classes),
                     latent_dim=_ld,
                     num_classes=num_classes,
+                    normalize_latent=_nl,
                 )
             )
     return factories
@@ -250,6 +252,7 @@ def afad_client_fn_builder(
     num_classes: int,
     local_epochs: int,
     cid_to_rate: dict[str, float],
+    normalize_latent: bool = False,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -265,12 +268,14 @@ def afad_client_fn_builder(
             model_name, num_classes=num_classes, model_rate=model_rate
         )
         model = FedGenModelWrapper(
-            base_model, latent_dim=LATENT_DIM, num_classes=num_classes
+            base_model, latent_dim=LATENT_DIM, num_classes=num_classes,
+            normalize_latent=normalize_latent,
         )
         generator = FedGenGenerator(
             noise_dim=LATENT_DIM,
             num_classes=num_classes,
             latent_dim=LATENT_DIM,
+            normalize_output=normalize_latent,
         )
         train_loader = train_loaders[int(cid) % len(train_loaders)]
 
@@ -378,6 +383,7 @@ def _build_strategy(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     use_adapters: bool = False,
+    normalize_latent: bool = False,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
@@ -391,12 +397,13 @@ def _build_strategy(
             noise_dim=LATENT_DIM,
             num_classes=num_classes,
             latent_dim=LATENT_DIM,
+            normalize_output=normalize_latent,
         )
 
     # Model factories
     if enable_fedgen:
         model_factories = build_wrapped_model_factories(
-            family_model_names, latent_dim=LATENT_DIM
+            family_model_names, latent_dim=LATENT_DIM, normalize_latent=normalize_latent
         )
     else:
         model_factories = build_plain_model_factories(
@@ -500,6 +507,7 @@ def run_single_experiment(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     use_adapters: bool = False,
+    normalize_latent: bool = False,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -530,6 +538,7 @@ def run_single_experiment(
         training_cfg=training_cfg,
         fedgen_cfg=fedgen_cfg,
         use_adapters=use_adapters,
+        normalize_latent=normalize_latent,
     )
 
     # Build client_fn based on experiment mode
@@ -545,7 +554,7 @@ def run_single_experiment(
             cid_to_rate,
         )
     elif enable_heterofl and enable_fedgen:
-        # AFAD Hybrid
+        # AFAD Hybrid (with optional L2 norm)
         client_fn = afad_client_fn_builder(
             train_loaders,
             test_loader,
@@ -554,6 +563,7 @@ def run_single_experiment(
             num_classes,
             local_epochs,
             cid_to_rate,
+            normalize_latent=normalize_latent,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -780,10 +790,11 @@ def main():
         methods_to_run = [m for m in all_methods if m not in results]
 
     method_configs = {
-        "HeteroFL Only":  {"enable_fedgen": False, "enable_heterofl": True,  "use_adapters": False},
-        "FedGen Only":    {"enable_fedgen": True,  "enable_heterofl": False, "use_adapters": False},
-        "AFAD Hybrid":    {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False},
-        "AFAD + Adapter": {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": True},
+        "HeteroFL Only":  {"enable_fedgen": False, "enable_heterofl": True,  "use_adapters": False, "normalize_latent": False},
+        "FedGen Only":    {"enable_fedgen": True,  "enable_heterofl": False, "use_adapters": False, "normalize_latent": False},
+        "AFAD Hybrid":    {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False, "normalize_latent": False},
+        "AFAD + Adapter": {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": True,  "normalize_latent": False},
+        "AFAD + L2Norm":  {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False, "normalize_latent": True},
     }
 
     for method in methods_to_run:
