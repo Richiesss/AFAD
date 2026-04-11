@@ -378,6 +378,7 @@ def _build_strategy(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     use_adapters: bool = False,
+    multi_rate_gen_training: bool = False,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
@@ -467,6 +468,7 @@ def _build_strategy(
         num_rounds=num_rounds,
         num_classes=num_classes,
         family_adapter_bank=adapter_bank,
+        multi_rate_gen_training=multi_rate_gen_training,
         min_fit_clients=num_clients,
         min_available_clients=num_clients,
         fraction_fit=1.0,
@@ -500,6 +502,7 @@ def run_single_experiment(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     use_adapters: bool = False,
+    multi_rate_gen_training: bool = False,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -530,6 +533,7 @@ def run_single_experiment(
         training_cfg=training_cfg,
         fedgen_cfg=fedgen_cfg,
         use_adapters=use_adapters,
+        multi_rate_gen_training=multi_rate_gen_training,
     )
 
     # Build client_fn based on experiment mode
@@ -585,7 +589,7 @@ def run_single_experiment(
         client_resources=CLIENT_RESOURCES,
         ray_init_args={
             "log_to_driver": False,
-            "object_store_memory": 500_000_000,  # 500MB: avoids /dev/shm exhaustion on WSL2
+            "object_store_memory": 4_000_000_000,  # 4GB: prevents Ray object spilling to /tmp
             # WSL2 fix: package only source code; resolve binary packages via PYTHONPATH.
             # Without this, Ray copies .so files to /tmp/ray which breaks on WSL2
             # ("cannot read file data" for numpy/torch shared libs).
@@ -780,10 +784,11 @@ def main():
         methods_to_run = [m for m in all_methods if m not in results]
 
     method_configs = {
-        "HeteroFL Only":  {"enable_fedgen": False, "enable_heterofl": True,  "use_adapters": False},
-        "FedGen Only":    {"enable_fedgen": True,  "enable_heterofl": False, "use_adapters": False},
-        "AFAD Hybrid":    {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False},
-        "AFAD + Adapter": {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": True},
+        "HeteroFL Only":       {"enable_fedgen": False, "enable_heterofl": True,  "use_adapters": False, "multi_rate_gen_training": False},
+        "FedGen Only":         {"enable_fedgen": True,  "enable_heterofl": False, "use_adapters": False, "multi_rate_gen_training": False},
+        "AFAD Hybrid":         {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False, "multi_rate_gen_training": False},
+        "AFAD + Adapter":      {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": True,  "multi_rate_gen_training": False},
+        "AFAD + MultiRateGen": {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False, "multi_rate_gen_training": True},
     }
 
     for method in methods_to_run:

@@ -33,6 +33,8 @@ from flwr.common import (
 )
 from flwr.server.client_proxy import ClientProxy
 
+from src.models.fedgen_wrapper import FedGenModelWrapper
+from src.models.registry import ModelRegistry
 from src.server.generator.afad_generator_trainer import AFADGeneratorTrainer
 from src.server.generator.family_adapter import FamilyAdapterBank
 from src.server.generator.fedgen_generator import FedGenGenerator
@@ -84,6 +86,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         family_adapter_bank: FamilyAdapterBank | None = None,
         adapter_epochs: int = 1,
         adapter_steps: int = 20,
+        multi_rate_gen_training: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -143,6 +146,9 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self._adapter_epochs = adapter_epochs
         self._adapter_steps = adapter_steps
         self._adapters_trained = False
+
+        # Multi-rate generator training: train generator against sub-rate models too
+        self._multi_rate_gen_training = multi_rate_gen_training
 
         # Track whether generator has been trained at least once
         self._generator_trained = False
@@ -207,6 +213,60 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             return None
 
         for key, arr in zip(keys, np_params):
+            state_dict[key] = torch.from_numpy(arr.copy())
+        model.load_state_dict(state_dict)
+        model.to(self._device)
+        return model
+
+    def _reconstruct_model_at_rate(
+        self,
+        model_name: str,
+        global_np_params: list[np.ndarray],
+        rate: float,
+    ) -> nn.Module | None:
+        """Reconstruct a sub-rate FedGenModelWrapper from rate=1.0 global params.
+
+        Slices the global params using HeteroFL distribute(), then loads them
+        into a FedGenModelWrapper whose backbone is scaled to the given rate.
+        Used for multi-rate generator training to expose sub-rate latent spaces.
+
+        Args:
+            model_name: Model registry name (e.g. 'heterofl_vit_small').
+            global_np_params: Rate=1.0 parameter arrays from family_global_models.
+            rate: Width scaling factor (e.g. 0.5 or 0.25).
+        """
+        if rate >= 1.0:
+            return self._reconstruct_model(model_name, global_np_params)
+
+        # Slice global params for the given rate
+        dummy_cid = f"__server_rate{rate}_{model_name}"
+        sub_params = self.hetero_aggregator.distribute(
+            global_np_params,
+            dummy_cid,
+            rate,
+            num_preserved_tail_layers=self._num_preserved_tail_layers,
+        )
+
+        # Build a sub-rate wrapped model matching the sliced parameter shape
+        latent_dim = self.generator.latent_dim if self.generator is not None else 32
+        base_model = ModelRegistry.create_model(
+            model_name, num_classes=self.num_classes, model_rate=rate
+        )
+        model = FedGenModelWrapper(
+            base_model, latent_dim=latent_dim, num_classes=self.num_classes
+        )
+
+        state_dict = model.state_dict()
+        keys = list(state_dict.keys())
+
+        if len(keys) != len(sub_params):
+            logger.warning(
+                f"Sub-rate param count mismatch for {model_name} rate={rate}: "
+                f"model has {len(keys)}, sliced {len(sub_params)}"
+            )
+            return None
+
+        for key, arr in zip(keys, sub_params):
             state_dict[key] = torch.from_numpy(arr.copy())
         model.load_state_dict(state_dict)
         model.to(self._device)
@@ -446,21 +506,62 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
             logger.info(f"Family {family}: FedAvg aggregated {len(items)} clients")
 
+    def _build_multi_rate_models(
+        self,
+    ) -> tuple[dict[str, nn.Module], dict[str, str]]:
+        """Reconstruct FedGenModelWrapper at all client rates per family.
+
+        Returns:
+            torch_models: Dict mapping '{family}_rate{rate}' to model.
+            model_to_family: Dict mapping model key to its family name.
+        """
+        torch_models: dict[str, nn.Module] = {}
+        model_to_family: dict[str, str] = {}
+
+        # Collect unique rates per family from client assignments
+        family_rates: dict[str, set[float]] = {}
+        for cid, rate in self.client_model_rates.items():
+            family = self.client_family_map.get(cid)
+            if family and family in self.family_global_models:
+                family_rates.setdefault(family, set()).add(rate)
+
+        for family, np_params in self.family_global_models.items():
+            model_name = self.family_model_names.get(family)
+            if not model_name:
+                continue
+            rates = sorted(family_rates.get(family, {1.0}), reverse=True)
+            for rate in rates:
+                key = f"{family}_rate{rate}"
+                model = self._reconstruct_model_at_rate(model_name, np_params, rate)
+                if model is not None:
+                    torch_models[key] = model
+                    model_to_family[key] = family
+
+        return torch_models, model_to_family
+
     def _train_generator_on_server(self, server_round: int) -> None:
         """Reconstruct FedGenModelWrapper models and train generator."""
         if not self.model_factories:
             logger.warning("No model_factories; skipping generator training")
             return
 
-        # Reconstruct full-rate FedGenModelWrapper from family_global_models
-        torch_models: dict[str, nn.Module] = {}
-        for family, np_params in self.family_global_models.items():
-            model_name = self.family_model_names.get(family)
-            if not model_name:
-                continue
-            model = self._reconstruct_model(model_name, np_params)
-            if model is not None:
-                torch_models[family] = model
+        # Reconstruct models: all rates per family (multi-rate) or rate=1.0 only
+        if self._multi_rate_gen_training and self.enable_heterofl:
+            torch_models, model_to_family = self._build_multi_rate_models()
+            # Map each model key to its family for label count lookup
+            def _family_of(key: str) -> str:
+                return model_to_family.get(key, key)
+        else:
+            torch_models = {}
+            for family, np_params in self.family_global_models.items():
+                model_name = self.family_model_names.get(family)
+                if not model_name:
+                    continue
+                model = self._reconstruct_model(model_name, np_params)
+                if model is not None:
+                    torch_models[family] = model
+            def _family_of(key: str) -> str:
+                return key
 
         if len(torch_models) < 2:
             logger.info("Not enough models for generator training")
@@ -470,7 +571,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         family_label_counts: dict[str, list[int]] = {}
         for cid, counts in self.client_label_counts.items():
             family = self.client_family_map.get(cid)
-            if family and family in torch_models:
+            if family and family in self.family_global_models:
                 if family not in family_label_counts:
                     family_label_counts[family] = [0] * self.num_classes
                 for i, c in enumerate(counts):
@@ -478,9 +579,10 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                         family_label_counts[family][i] += c
 
         # Build label_counts_list aligned with torch_models order.
-        # Use zeros for families that have no clients (e.g. vit in a cnn-only run).
+        # For multi-rate, models from the same family share the same label counts.
         label_counts_list = [
-            family_label_counts.get(f, [0] * self.num_classes) for f in torch_models
+            family_label_counts.get(_family_of(k), [0] * self.num_classes)
+            for k in torch_models
         ]
         has_any_data = any(any(c > 0 for c in counts) for counts in label_counts_list)
 
@@ -505,13 +607,39 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self._generator_trained = True
         logger.info(f"Generator trained with {len(torch_models)} family models")
 
-        # Train per-family adapters after generator update (frozen generator)
+        # Train per-family adapters after generator update (frozen generator).
+        # Adapters are keyed by family name; use the first (highest-rate) model
+        # per family so the adapter sees the full-capacity latent space.
         if self.family_adapter_bank is not None and self.generator_trainer is not None:
+            adapter_models: dict[str, nn.Module] = {}
+            seen_families: set[str] = set()
+            for k, m in torch_models.items():
+                fam = _family_of(k)
+                if fam not in seen_families:
+                    adapter_models[fam] = m
+                    seen_families.add(fam)
+
+            adapter_family_counts = [
+                family_label_counts.get(f, [0] * self.num_classes)
+                for f in adapter_models
+            ]
+            has_adapter_data = any(
+                any(c > 0 for c in cnt) for cnt in adapter_family_counts
+            )
+            if has_adapter_data:
+                adapter_lw, adapter_ql = self.generator_trainer.get_label_weights(
+                    adapter_family_counts, num_classes=self.num_classes
+                )
+            else:
+                n = len(adapter_models)
+                adapter_lw = np.ones((self.num_classes, n)) / n
+                adapter_ql = qualified_labels
+
             self.generator_trainer.train_adapters(
-                models=torch_models,
+                models=adapter_models,
                 adapter_bank=self.family_adapter_bank,
-                label_weights=label_weights,
-                qualified_labels=qualified_labels,
+                label_weights=adapter_lw,
+                qualified_labels=adapter_ql,
                 num_epochs=self._adapter_epochs,
                 num_steps=self._adapter_steps,
             )
