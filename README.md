@@ -427,6 +427,24 @@ Sub-rate クライアントは bottleneck weight の最初の `int(32 × rate)` 
 
 FedGen Only との **16.66pp ギャップは付加的な手法では解消できない構造的問題**であることが確認された。根本解決には、HeteroFL の width-scaling 制約を緩和しつつ FedGen の Non-IID 耐性を活かす、より抜本的なアーキテクチャ変更が必要と考えられる。
 
+#### 5.3.3 Bottleneck L2 正規化実験（feature/bottleneck-l2-norm）
+
+異種アーキテクチャ間の潜在空間不整合を、L2 正規化による単位超球面への射影で解消することを試みた。
+
+**手法**: `FedGenModelWrapper` の bottleneck 出力に `F.normalize(z, p=2, dim=-1)` を適用し、`FedGenGenerator` の出力にも同一の L2 正規化を適用する。rate=1.0/0.5/0.25 の bottleneck 出力次元は ViT で 384/192/96 と異なるが、L2 正規化後はすべて単位超球面上に射影されるため、Generator との KD 距離が rate に依存しなくなる（理論的仮説）。
+
+**実験結果**
+
+| 手法 | BEST | Final | vs AFAD Hybrid |
+|------|:----:|:-----:|:--------------:|
+| AFAD Hybrid（ベースライン） | 67.84% | 67.73% | — |
+| **AFAD + L2Norm** | **66.70%** | **66.62%** | **−1.14pp** |
+| FedGen Only（上限） | 84.66% | 84.62% | +16.82pp |
+
+**結論**: L2 正規化はベースラインを −1.14pp 下回り、潜在空間の整合化には至らなかった。
+
+精度はラウンド 27 前後でプラトー（66.65〜66.70%）に達し、その後は収束している。L2 正規化によって全 rate の bottleneck 出力がノルム=1 に拘束されるが、**単位超球面上でも各 rate の特徴方向（角度）の分布は依然として異なる**ため、Generator との KD 信号のミスマッチは解消されない。正規化は分布のスケール差を除去するのみであり、方向分布の根本的な整合には不十分であることが示された。
+
 ### 5.4 アブレーション実験
 
 Phase 2（Non-IID）をベースに実施。
@@ -438,6 +456,7 @@ Phase 2（Non-IID）をベースに実施。
 | **Case A** | Server-side Distillation (steps=20) | −0.70pp | Generator 過学習が Non-IID 局所特化を破壊 |
 | **Case B** | Nested Bottleneck (8/16 dim) | −4.76pp | 階層的制約が学習を阻害 |
 | **Case C** | FedAvg 集約（shape-aware） | −8.20pp | HeteroFL count-based 集約の合理性を逆説的に確認 |
+| **L2Norm** | Bottleneck + Generator に L2 正規化 | −1.14pp | スケール差は除去できるが方向分布の不整合は残存 |
 
 **結論**: AFAD vs FedGen のギャップは構造的問題。Generator が rate=1.0 の潜在空間に特化しているため、sub-rate クライアントは KD 信号を適切に活用できない。単純なハイパーパラメータ調整・集約方式変更・潜在空間制約のいずれも根本解決にならない。
 
@@ -475,6 +494,7 @@ Non-IID 環境での FedGen（84.66%）と AFAD + Proto（68.00%）の 16.66pp �
 | **AFAD + ServerDistill** | サーバー側クラスバランス蒸留 | Non-IID データ偏り | 67.14% | × Generator 過学習 |
 | **AFAD + NestedBN** | 階層的潜在部分空間の共有 | 潜在空間構造化 | 62.53% | × 学習阻害 |
 | **AFAD + FedAvg** | FedAvg 集約への切り替え | 集約安定性 | 59.35% | × 構造的不適合 |
+| **AFAD + L2Norm** | Bottleneck/Generator に L2 正規化 | 潜在空間スケール整合 | 66.70% | × 方向分布の不整合は残存 |
 
 Proto と RateCond は「生成側の整合」を、AnchorKD は「識別側の整合」を担う。両者を組み合わせた手法が今後の有望な方向と考えられる。
 
@@ -504,6 +524,7 @@ Non-IID 環境では逆に潜在空間整合が重要になるため、Phase 2 �
 | **AFAD + Proto** | **68.00%** | **67.39%** | **+0.16pp** |
 | AFAD + NestedBN | 62.53% | 60.97% | −4.76pp |
 | AFAD + FedAvg | 59.35% | 58.53% | −8.20pp |
+| AFAD + L2Norm | 66.70% | 66.62% | −1.14pp |
 | FedGen Only | 84.66% | 84.62% | +16.82pp |
 
 ### 7.2 手法特性比較

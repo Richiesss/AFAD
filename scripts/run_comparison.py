@@ -595,7 +595,7 @@ def run_single_experiment(
         client_resources=CLIENT_RESOURCES,
         ray_init_args={
             "log_to_driver": False,
-            "object_store_memory": 500_000_000,  # 500MB: avoids /dev/shm exhaustion on WSL2
+            "object_store_memory": 4_000_000_000,  # 4GB: prevents spilling on WSL2 (23GB RAM available)
             # WSL2 fix: package only source code; resolve binary packages via PYTHONPATH.
             # Without this, Ray copies .so files to /tmp/ray which breaks on WSL2
             # ("cannot read file data" for numpy/torch shared libs).
