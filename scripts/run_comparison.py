@@ -378,6 +378,7 @@ def _build_strategy(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     use_adapters: bool = False,
+    server_test_loader=None,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
@@ -467,6 +468,7 @@ def _build_strategy(
         num_rounds=num_rounds,
         num_classes=num_classes,
         family_adapter_bank=adapter_bank,
+        server_test_loader=server_test_loader,
         min_fit_clients=num_clients,
         min_available_clients=num_clients,
         fraction_fit=1.0,
@@ -530,6 +532,7 @@ def run_single_experiment(
         training_cfg=training_cfg,
         fedgen_cfg=fedgen_cfg,
         use_adapters=use_adapters,
+        server_test_loader=test_loader,
     )
 
     # Build client_fn based on experiment mode
@@ -615,14 +618,18 @@ def run_single_experiment(
             {
                 "round": rm.round_num,
                 "accuracy": rm.accuracy,
+                "server_accuracy": rm.server_accuracy,
                 "loss": rm.loss,
                 "wall_time": rm.wall_time,
             }
         )
 
     summary = strategy.metrics_collector.summary()
+    best_server = summary.get("best_server_accuracy")
+    server_str = f", best_server_accuracy={best_server:.4f}" if best_server else ""
     logger.info(
         f"{label} finished: best_accuracy={summary.get('best_accuracy', 0):.4f}"
+        f"{server_str}"
     )
 
     return rounds

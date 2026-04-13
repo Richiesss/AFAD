@@ -13,6 +13,7 @@ class RoundMetrics:
     round_num: int
     loss: float = 0.0
     accuracy: float = 0.0
+    server_accuracy: float | None = None  # rate=1.0 global model on centralized test set
     num_clients: int = 0
     wall_time: float = 0.0
 
@@ -33,6 +34,7 @@ class MetricsCollector:
         round_num: int,
         loss: float = 0.0,
         accuracy: float = 0.0,
+        server_accuracy: float | None = None,
         num_clients: int = 0,
     ) -> RoundMetrics:
         """Record metrics for a completed round."""
@@ -41,13 +43,17 @@ class MetricsCollector:
             round_num=round_num,
             loss=loss,
             accuracy=accuracy,
+            server_accuracy=server_accuracy,
             num_clients=num_clients,
             wall_time=wall_time,
         )
         self.rounds.append(metrics)
+        server_str = (
+            f", server_acc={server_accuracy:.4f}" if server_accuracy is not None else ""
+        )
         logger.info(
-            f"Round {round_num}: loss={loss:.4f}, accuracy={accuracy:.4f}, "
-            f"clients={num_clients}, time={wall_time:.1f}s"
+            f"Round {round_num}: loss={loss:.4f}, accuracy={accuracy:.4f}"
+            f"{server_str}, clients={num_clients}, time={wall_time:.1f}s"
         )
         return metrics
 
@@ -61,7 +67,7 @@ class MetricsCollector:
             return {}
         accuracies = [r.accuracy for r in self.rounds]
         losses = [r.loss for r in self.rounds]
-        return {
+        result: dict[str, float] = {
             "num_rounds": len(self.rounds),
             "best_accuracy": max(accuracies),
             "final_accuracy": accuracies[-1],
@@ -69,3 +75,8 @@ class MetricsCollector:
             "final_loss": losses[-1],
             "total_wall_time": sum(r.wall_time for r in self.rounds),
         }
+        server_accs = [r.server_accuracy for r in self.rounds if r.server_accuracy is not None]
+        if server_accs:
+            result["best_server_accuracy"] = max(server_accs)
+            result["final_server_accuracy"] = server_accs[-1]
+        return result

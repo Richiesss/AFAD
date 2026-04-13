@@ -21,6 +21,7 @@ import flwr as fl
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 from flwr.common import (
     EvaluateIns,
     EvaluateRes,
@@ -84,6 +85,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         family_adapter_bank: FamilyAdapterBank | None = None,
         adapter_epochs: int = 1,
         adapter_steps: int = 20,
+        server_test_loader: DataLoader | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -91,6 +93,7 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self.model_factories = model_factories or {}
         self.enable_fedgen = enable_fedgen
         self.enable_heterofl = enable_heterofl
+        self.server_test_loader = server_test_loader
         self.num_rounds = num_rounds
         self.num_classes = num_classes
 
@@ -211,6 +214,61 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         model.load_state_dict(state_dict)
         model.to(self._device)
         return model
+
+    def _evaluate_server_models(self, server_round: int) -> dict[str, float]:
+        """Evaluate rate=1.0 global models on centralized test set.
+
+        Returns:
+            Dict with per-family accuracy and overall average, e.g.
+            {"cnn": 0.92, "vit": 0.95, "server_accuracy": 0.935}
+        """
+        if self.server_test_loader is None:
+            return {}
+
+        metrics: dict[str, float] = {}
+        total_correct = 0
+        total_samples = 0
+
+        for family, np_params in self.family_global_models.items():
+            model_name = self.family_model_names.get(family)
+            if model_name is None:
+                continue
+            model = self._reconstruct_model(model_name, np_params)
+            if model is None:
+                continue
+
+            model.eval()
+            correct = 0
+            samples = 0
+            with torch.no_grad():
+                for batch in self.server_test_loader:
+                    images, labels = batch[0].to(self._device), batch[1].to(self._device)
+                    if labels.dim() > 1:
+                        labels = labels.squeeze(1)
+                    outputs = model(images)
+                    if isinstance(outputs, dict):
+                        outputs = outputs.get("logits", next(iter(outputs.values())))
+                    preds = outputs.argmax(dim=1)
+                    correct += (preds == labels).sum().item()
+                    samples += labels.size(0)
+
+            family_acc = correct / samples if samples > 0 else 0.0
+            metrics[f"server_acc_{family}"] = family_acc
+            total_correct += correct
+            total_samples += samples
+            logger.info(
+                f"Round {server_round} server eval [{family}]: "
+                f"accuracy={family_acc:.4f} ({correct}/{samples})"
+            )
+
+        if total_samples > 0:
+            metrics["server_accuracy"] = total_correct / total_samples
+            logger.info(
+                f"Round {server_round} server eval [overall]: "
+                f"accuracy={metrics['server_accuracy']:.4f}"
+            )
+
+        return metrics
 
     def _serialize_generator_params(self) -> bytes | None:
         """Serialize generator params as bytes for Flower config."""
@@ -585,10 +643,15 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         avg_loss = total_loss / total_examples if total_examples > 0 else 0.0
         avg_accuracy = total_accuracy / total_examples if total_examples > 0 else 0.0
 
+        # Server-side evaluation: rate=1.0 global models on centralized test set
+        server_metrics = self._evaluate_server_models(server_round)
+        server_accuracy = server_metrics.get("server_accuracy")
+
         self.metrics_collector.record_round(
             round_num=server_round,
             loss=avg_loss,
             accuracy=avg_accuracy,
+            server_accuracy=server_accuracy,
             num_clients=len(results),
         )
 
@@ -598,9 +661,10 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             "loss": avg_loss,
             "num_clients": len(results),
         }
+        metrics.update(server_metrics)
 
         logger.info(
-            f"Round {server_round} evaluation: "
+            f"Round {server_round} client eval: "
             f"accuracy={avg_accuracy:.4f}, loss={avg_loss:.4f}"
         )
 
