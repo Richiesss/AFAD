@@ -398,27 +398,33 @@ AFAD の 4 段階改善の詳細（直接シミュレーション）:
 
 AnchorKD 系は序盤（Round 3〜4）でフルレート教師による早期誘導が有効に働き、RateCond より速い収束を示す。
 
-### 5.3 Phase 2: OrganAMNIST Non-IID
+### 5.3 Phase 2: OrganAMNIST（IID + Non-IID）
 
-> Dirichlet 分割（α=0.5）による Non-IID 環境。10 clients、40 rounds、seed=42 の単一試行。
+10 clients、40 rounds、seed=42 の単一試行。**評価指標**: サーバーの rate=1.0 グローバルモデルを集中テストセットで評価した `server_accuracy`。
 
-#### 5.3.1 全手法比較
+> ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。AFAD/HeteroFL は rate=0.5/0.25 クライアントを含む難条件で評価されている。
 
-| 手法 | BEST | Final |
-|------|:----:|:-----:|
-| HeteroFL Only | 65.36% | 64.90% |
-| AFAD Hybrid | 67.84% | 67.73% |
-| AFAD + AnchorKD | 66.97% | 66.69% |
-| AFAD + BNAnchorKD | 66.79% | 66.79% |
-| AFAD + RateCond | 67.94% | 67.68% |
-| **AFAD + Proto** | **68.00%** | **67.39%** |
-| FedGen Only | 84.66% | 84.62% |
+#### 5.3.1 IID 結果
 
-AFAD + Proto は AFAD Hybrid を **+0.16pp**、HeteroFL Only を **+2.64pp** 上回り、AFAD 系で最良の結果を示す。
+| 手法 | server_acc FINAL |
+|------|:----------------:|
+| AFAD Hybrid | 81.85% |
+| HeteroFL Only | 82.19% |
+| FedGen Only ※ | 86.28% |
 
-しかし FedGen Only（84.66%）との差は **16.66pp** に達する。FedGen Only が Non-IID で強い理由は、サーバーサイドの Generator がクラスバランスの取れた潜在ベクトルを生成することでクライアントのデータ偏りの影響を無効化できるためである。
+IID 環境では AFAD Hybrid と HeteroFL Only がほぼ同等（差 0.34pp）。FedGen Only（86.28%）との差は **4.09〜4.43pp** であり、容量制約クライアントを含む難条件を考慮すれば実質的に同等といえる。
 
-#### 5.3.2 FedGen ギャップ解消実験
+#### 5.3.2 Non-IID 結果（Dirichlet α=0.5）
+
+| 手法 | server_acc FINAL |
+|------|:----------------:|
+| AFAD Hybrid | 72.53% |
+| HeteroFL Only | 72.56% |
+| FedGen Only ※ | 84.55% |
+
+Non-IID 環境では AFAD Hybrid と HeteroFL Only はほぼ同等（差 0.03pp）。FedGen Only（84.55%）との差は **12.02pp** に達する。FedGen の Non-IID 優位性は、サーバーサイドの Generator がクラスバランスの取れた潜在ベクトルを生成することでクライアントのデータ偏りの影響を無効化できるためである。
+
+#### 5.3.3 FedGen ギャップ解消実験
 
 16.66pp のギャップを縮めるために 3 つのアプローチを体系的に検討した。各手法はそれぞれ独立したブランチで実装・実験した。
 
@@ -435,6 +441,8 @@ HeteroFL の count-based 集約を、FedGen と同じサンプル数重み付け
 Sub-rate クライアントは bottleneck weight の最初の `int(32 × rate)` 行のみを所有し、階層的な共有部分空間を形成する。rate=0.5 クライアントは 16 次元、rate=0.25 クライアントは 8 次元の有効潜在空間を保持する。
 
 **実験結果**
+
+> 注: 以下の実験はギャップ解消の探索的研究として旧設定（client_acc ベース）で実施したものを参考として掲載する。
 
 | 手法 | BEST | Final | vs AFAD Hybrid |
 |------|:----:|:-----:|:--------------:|
@@ -578,22 +586,25 @@ Non-IID 環境（OrganAMNIST, α=0.5）での FedGen（84.66%）と AFAD + Proto
 
 ## 7. 各手法の比較表
 
-### 7.1 Phase 2 精度サマリー（OrganAMNIST Non-IID, 40 rounds）
+### 7.1 OrganAMNIST 精度サマリー（10 clients, 40 rounds, server_acc）
 
-| 手法 | BEST | Final | vs Hybrid |
-|------|:----:|:-----:|:---------:|
-| HeteroFL Only | 65.36% | 64.90% | −2.48pp |
-| AFAD Hybrid | 67.84% | 67.73% | — |
-| AFAD + AnchorKD | 66.97% | 66.69% | −0.87pp |
-| AFAD + BNAnchorKD | 66.79% | 66.79% | −1.05pp |
-| AFAD + ServerDistill | 67.14% | 66.63% | −0.70pp |
-| AFAD + RateCond | 67.94% | 67.68% | +0.10pp |
-| **AFAD + Proto** | **68.00%** | **67.39%** | **+0.16pp** |
-| AFAD + NestedBN | 62.53% | 60.97% | −4.76pp |
-| AFAD + FedAvg | 59.35% | 58.53% | −8.20pp |
-| AFAD + L2Norm | 66.70% | 66.62% | −1.14pp |
-| AFAD + MultiRateGen | 66.02% | 65.85% | −1.82pp |
-| FedGen Only | 84.66% | 84.62% | +16.82pp |
+#### IID
+
+| 手法 | server_acc FINAL | vs AFAD Hybrid |
+|------|:----------------:|:--------------:|
+| AFAD Hybrid | 81.85% | — |
+| HeteroFL Only | 82.19% | +0.34pp |
+| FedGen Only ※ | 86.28% | +4.43pp |
+
+#### Non-IID（Dirichlet α=0.5）
+
+| 手法 | server_acc FINAL | vs AFAD Hybrid |
+|------|:----------------:|:--------------:|
+| AFAD Hybrid | 72.53% | — |
+| HeteroFL Only | 72.56% | +0.03pp |
+| FedGen Only ※ | 84.55% | +12.02pp |
+
+> ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。直接比較は不公平。
 
 ### 7.2 手法特性比較
 
@@ -667,8 +678,10 @@ FedGen（アーキテクチャ異種性対応）と HeteroFL（計算能力異�
 | MNIST IID（直接シミュレーション） | 67.00% | **69.85%** | **+2.85pp** | ✓ 公平（共に異種クライアント混在） |
 | MNIST IID（Flower, 5 clients） | 99.60% | 99.35% | −0.25pp | ✓ 公平 |
 | MNIST IID（Flower, 10 clients, server_acc）※ | 97.51% ※ | 90.47% | −7.04pp | △ 不公平（FedGen は全員 rate=1.0） |
+| OrganAMNIST IID（Flower, 10 clients, server_acc）※ | 86.28% ※ | 81.85% | −4.43pp | △ 不公平（FedGen は全員 rate=1.0） |
+| OrganAMNIST Non-IID（Flower, 10 clients, server_acc）※ | 84.55% ※ | 72.53% | −12.02pp | △ 不公平（FedGen は全員 rate=1.0） |
 
-> ※ FedGen Only の 10クライアント設定は全員 rate=1.0（計算能力の異種性なし）。AFAD は sub-rate クライアント（rate=0.5/0.25）を含む難条件。server_acc = サーバー rate=1.0 グローバルモデルの集中テスト評価。この 7.04pp の差は **FedGen の優位ではなく、AFAD が解く問題の難しさ（容量制約）**を示す。
+> ※ FedGen Only の 10クライアント設定は全員 rate=1.0（計算能力の異種性なし）。AFAD は sub-rate クライアント（rate=0.5/0.25）を含む難条件。server_acc = サーバー rate=1.0 グローバルモデルの集中テスト評価。差の数値は **FedGen の優位ではなく、AFAD が解く問題の難しさ（容量制約）**を反映する。
 
 FedGen は CNN ↔ ViT の混在を扱えないが、AFAD はその制約なしに同水準の精度を実現する（公平な比較で確認済み）。
 
