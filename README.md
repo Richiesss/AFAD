@@ -10,7 +10,7 @@
 
 本研究では **AFAD（Adaptive Federated Architecture Distribution）** を提案する。AFAD は両手法を統合し、共有 32 次元潜在空間と Generator を介してアーキテクチャをまたいだ知識共有を実現しながら、幅スケーリングで計算能力の異種性にも対応する。単純な統合（ナイーブ統合）から 4 段階の改善を経て、さらに **Prototype Anchoring**・**Rate-conditioned Generator**・**AnchorKD** という 3 種の拡張手法を提案する。
 
-**IID 環境（MNIST）における主要結果**: AFAD Hybrid は直接シミュレーション（公平な比較条件）で FedGen Only（67.00%）を **+2.85pp 上回る 69.85%** を達成する。FedGen は CNN と ViT の混在設定を扱えないのに対し、AFAD はその制約を持たない。なお、10クライアント Flower 設定では FedGen Only（97.97%）が AFAD Hybrid（86.78%）を上回るが、この設定では FedGen が全員 rate=1.0（計算能力の異種性なし）で動作するため直接比較は不公平である。これが AFAD の本質的な貢献である。
+**IID 環境（MNIST）における主要結果**: AFAD Hybrid は直接シミュレーション（公平な比較条件）で FedGen Only（67.00%）を **+2.85pp 上回る 69.85%** を達成する。FedGen は CNN と ViT の混在設定を扱えないのに対し、AFAD はその制約を持たない。なお、10クライアント Flower 設定（サーバーの rate=1.0 グローバルモデルで評価）では FedGen Only（server_acc 97.51%）が AFAD Hybrid（server_acc 90.47%）を上回るが、この設定では FedGen が全員 rate=1.0（計算能力の異種性なし）で動作するため直接比較は不公平である。AFAD と HeteroFL は rate=0.5/0.25 の容量制約クライアントを含む難条件で評価されている。これが AFAD の本質的な貢献である。
 
 **Non-IID 環境（OrganAMNIST, α=0.5）における課題**: AFAD + Proto は HeteroFL Only を **+2.64pp** 上回る一方、FedGen Only との間には **16.66pp のギャップ**が存在する。このギャップの根本原因（Generator の潜在空間が rate=1.0 に特化しており sub-rate クライアントのボトルネック分布と不整合）を体系的な実験（5 種のギャップ解消アプローチ）により特定した。Non-IID 環境への本格的な対応は今後の課題である。
 
@@ -370,17 +370,19 @@ AFAD の 4 段階改善の詳細（直接シミュレーション）:
 
 #### 5.2.3 Flower シミュレーション（10 clients, 40 rounds）— Phase 2 と同一条件
 
-> `run_comparison.py`（Flower + Ray）、`config/afad_phase1_10client_config.yaml` 使用。seed=42 の単一試行。Phase 2（OrganAMNIST Non-IID）と同じクライアント構成・ラウンド数でIID環境を評価。
+> `run_comparison.py`（Flower + Ray）、`config/afad_phase1_10client_config.yaml` 使用。seed=42 の単一試行。Phase 2（OrganAMNIST Non-IID）と同じクライアント構成・ラウンド数でIID環境を評価。**評価指標**: サーバーの rate=1.0 グローバルモデルを集中テストセットで評価した `server_accuracy`（括弧内は各クライアントのサブレートモデル平均精度）。
 
-| 手法 | BEST | FINAL |
-|------|:----:|:-----:|
-| HeteroFL Only | 87.28% | 87.13% |
-| **AFAD Hybrid** | **86.78%** | **86.61%** |
-| FedGen Only ※ | 97.97% | 97.66% |
+| 手法 | server_acc BEST | server_acc FINAL | (client_acc FINAL) |
+|------|:--------------:|:----------------:|:-----------------:|
+| **AFAD Hybrid** | **90.47%** | **90.47%** | (86.83%) |
+| HeteroFL Only | 90.19% | 90.17% | (86.41%) |
+| FedGen Only ※ | 97.58% | 97.51% | (97.51%) |
 
-> **※ 重要な注記**: FedGen Only は**全クライアントが rate=1.0**（フルサイズモデル）で動作する。FedGen は固定次元の潜在ベクトルを前提とするため、sub-rate クライアントへの対応が構造的に不可能である（異なる rate のボトルネックは異なる入力次元を持ち、Generator との整合が取れない）。一方、AFAD/HeteroFL は rate=0.5・0.25 のクライアントを含む。**FedGen の 97.97% は「計算能力の異種性なし」の条件であり、AFAD との直接比較は不公平**である。
+> **※ 重要な注記**: FedGen Only は**全クライアントが rate=1.0**（フルサイズモデル）で動作する。FedGen は固定次元の潜在ベクトルを前提とするため、sub-rate クライアントへの対応が構造的に不可能である（異なる rate のボトルネックは異なる入力次元を持ち、Generator との整合が取れない）。一方、AFAD/HeteroFL は rate=0.5・0.25 のクライアントを含む。**FedGen の 97.51% は「計算能力の異種性なし」の条件であり、AFAD との直接比較は不公平**である。
 >
 > この設定での精度差は FedGen の性能優位ではなく、**AFAD が解く問題の難しさ（sub-rate クライアントの容量制約）**を示している。AFAD の公平な比較は直接シミュレーション（5.2.1）の結果による。
+>
+> **client_acc と server_acc のギャップ**（AFAD: 86.83% → 90.47%、+3.64pp / HeteroFL: 86.41% → 90.17%、+3.76pp）は、クライアント評価がサブレートモデルによる過小評価であることを示す。公正なサーバー評価では両手法とも 90% を超える。
 
 **AnchorKD の初期収束優位性**（MNIST IID、Round 1〜5）:
 
@@ -485,9 +487,9 @@ HeteroFL と FedGen を素朴に統合すると **9.55pp（60.30% → 69.85%）�
 | アーキテクチャ異種性（CNN ↔ ViT） | ✓ | **✓** |
 | IID 精度（MNIST 直接シミュレーション） | 67.00% | **69.85%（+2.85pp）** |
 | IID 精度（MNIST Flower, 5 clients） | 99.60% | 99.35%（−0.25pp） |
-| IID 精度（MNIST Flower, 10 clients）※ | 97.97% | 86.78%（−11.19pp） |
+| IID 精度（MNIST Flower, 10 clients, server_acc）※ | 97.51% | 90.47%（−7.04pp） |
 
-> ※ 10クライアント設定では FedGen は全員 rate=1.0（計算能力の異種性なし）で動作するため、直接比較は不公平。AFAD は rate=0.5/0.25 の容量制約クライアントを含む難条件で評価されている。
+> ※ 10クライアント設定では FedGen は全員 rate=1.0（計算能力の異種性なし）で動作するため、直接比較は不公平。AFAD は rate=0.5/0.25 の容量制約クライアントを含む難条件で評価されている。server_acc = サーバーの rate=1.0 グローバルモデルを集中テストセットで評価した値。
 >
 > **公平な比較（直接シミュレーション）では AFAD が FedGen を上回る（+2.85pp）**。FedGen が扱えない設定（幅の異なるクライアント混在）を扱いながら同等以上の精度を達成している点が AFAD の本質的な貢献である。
 
@@ -616,9 +618,9 @@ FedGen（アーキテクチャ異種性対応）と HeteroFL（計算能力異�
 |------|:-----------:|:-----------:|:--:|:----------:|
 | MNIST IID（直接シミュレーション） | 67.00% | **69.85%** | **+2.85pp** | ✓ 公平（共に異種クライアント混在） |
 | MNIST IID（Flower, 5 clients） | 99.60% | 99.35% | −0.25pp | ✓ 公平 |
-| MNIST IID（Flower, 10 clients） | 97.97% ※ | 86.78% | −11.19pp | △ 不公平（FedGen は全員 rate=1.0） |
+| MNIST IID（Flower, 10 clients, server_acc）※ | 97.51% ※ | 90.47% | −7.04pp | △ 不公平（FedGen は全員 rate=1.0） |
 
-> ※ FedGen Only の 10クライアント設定は全員 rate=1.0（計算能力の異種性なし）。AFAD は sub-rate クライアント（rate=0.5/0.25）を含む難条件。この 11.19pp の差は **FedGen の優位ではなく、AFAD が解く問題の難しさ（容量制約）**を示す。
+> ※ FedGen Only の 10クライアント設定は全員 rate=1.0（計算能力の異種性なし）。AFAD は sub-rate クライアント（rate=0.5/0.25）を含む難条件。server_acc = サーバー rate=1.0 グローバルモデルの集中テスト評価。この 7.04pp の差は **FedGen の優位ではなく、AFAD が解く問題の難しさ（容量制約）**を示す。
 
 FedGen は CNN ↔ ViT の混在を扱えないが、AFAD はその制約なしに同水準の精度を実現する（公平な比較で確認済み）。
 
