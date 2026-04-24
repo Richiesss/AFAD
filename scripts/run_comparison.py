@@ -254,6 +254,8 @@ def afad_client_fn_builder(
     relkd_scale: float = 0.0,
     consensus_scale: float = 0.0,
     backbone_align_scale: float = 0.0,
+    supcon_scale: float = 0.0,
+    supcon_tau: float = 0.1,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -303,6 +305,8 @@ def afad_client_fn_builder(
             relkd_scale=relkd_scale,
             consensus_scale=consensus_scale,
             backbone_align_scale=backbone_align_scale,
+            supcon_scale=supcon_scale,
+            supcon_tau=supcon_tau,
         ).to_client()
 
     return client_fn
@@ -523,6 +527,8 @@ def run_single_experiment(
     use_per_family_generators: bool = False,
     backbone_align_scale: float = 0.0,
     s_cfc_gamma: float = 0.0,
+    supcon_scale: float = 0.0,
+    supcon_tau: float = 0.1,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -585,6 +591,8 @@ def run_single_experiment(
             relkd_scale=relkd_scale,
             consensus_scale=consensus_scale,
             backbone_align_scale=backbone_align_scale,
+            supcon_scale=supcon_scale,
+            supcon_tau=supcon_tau,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -880,6 +888,18 @@ def main():
         "AFAD + BackboneAlign + RelKD": {
             "enable_fedgen": True, "enable_heterofl": True,
             "use_adapters": False, "backbone_align_scale": 0.1, "relkd_scale": 1.0,
+        },
+        # Latent SupCon: supervised contrastive backbone alignment via InfoNCE.
+        # Replaces MSE coordinate matching with angular/topological alignment:
+        # z_local attracted to G(y_i), repelled from G(y_j≠i). Invariant to
+        # feature scale differences between CNN and ViT families.
+        "AFAD + LatentSupCon": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "supcon_scale": 0.1, "supcon_tau": 0.1,
+        },
+        "AFAD + LatentSupCon (scale=0.5)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "supcon_scale": 0.5, "supcon_tau": 0.1,
         },
         # S-CFC: Server-side Cross-Family Consensus loss added to generator training.
         # Forces generator to find "universal anchor points" where CNN and ViT classifiers

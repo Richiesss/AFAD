@@ -87,6 +87,12 @@ class AFADClient(fl.client.NumPyClient):
             features consistent with the generator's latent space.
             This addresses the backbone-bypass structural gap: current FedGen KD
             only trains the classifier; this term propagates signal into the backbone.
+        supcon_scale: Weight for Latent Supervised Contrastive loss (0.0 = disabled).
+            Replaces Euclidean MSE alignment with angular/topological alignment via
+            InfoNCE. Backbone features z_local are attracted to G(y_i) (positive)
+            and repelled from G(y_j) for j≠i (negatives). Invariant to feature
+            scale differences across heterogeneous architectures.
+        supcon_tau: Temperature for InfoNCE contrastive loss (default 0.1).
     """
 
     def __init__(
@@ -113,6 +119,8 @@ class AFADClient(fl.client.NumPyClient):
         relkd_scale: float = 0.0,
         consensus_scale: float = 0.0,
         backbone_align_scale: float = 0.0,
+        supcon_scale: float = 0.0,
+        supcon_tau: float = 0.1,
     ):
         self.cid = cid
         self.model = model
@@ -142,6 +150,8 @@ class AFADClient(fl.client.NumPyClient):
         # Populated each round from server config["consensus_labels"]
         self.consensus_labels: np.ndarray | None = None
         self.backbone_align_scale = backbone_align_scale
+        self.supcon_scale = supcon_scale
+        self.supcon_tau = supcon_tau
 
         # Precompute label counts and available labels
         self.label_counts = self._compute_label_counts()
@@ -449,6 +459,31 @@ class AFADClient(fl.client.NumPyClient):
                         S_gen = gen_n @ gen_n.T     # [B, B]
                         relkd_loss = self.relkd_scale * F.mse_loss(S_gen, S_real)
                         loss = loss + relkd_loss
+
+                    # Latent SupCon: supervised contrastive alignment of backbone features.
+                    # Shifts from MSE coordinate matching to InfoNCE angular/topological
+                    # alignment — invariant to feature scale differences across CNN/ViT.
+                    # z_local is attracted to G(y_i) and repelled from G(y_j) for j≠i.
+                    # sim_matrix[i,c] = cos(z_local[i], G(c)) / tau → CrossEntropy(labels)
+                    if self.supcon_scale > 0:
+                        z_local = self.model.bottleneck(self.model.backbone(images))
+                        z_local_n = F.normalize(z_local, p=2, dim=1)  # [B, 32]
+                        # Generate anchor z for all classes at once
+                        all_classes = torch.arange(
+                            self.num_classes, dtype=torch.long, device=self.device
+                        )
+                        with torch.no_grad():
+                            gen_all = self.generator(all_classes)
+                            z_all = gen_all["output"]  # [num_classes, 32]
+                            if self.family_adapter is not None:
+                                z_all = self.family_adapter(z_all)
+                        z_all_n = F.normalize(z_all, p=2, dim=1)  # [num_classes, 32]
+                        # InfoNCE: treat label as positive index
+                        sim_matrix = z_local_n @ z_all_n.T / self.supcon_tau  # [B, C]
+                        supcon_loss = self.supcon_scale * F.cross_entropy(
+                            sim_matrix, labels
+                        )
+                        loss = loss + supcon_loss
 
                     # Cross-family Consensus: align generated logits to server-side
                     # per-class soft labels averaged from CNN + ViT classifiers.
