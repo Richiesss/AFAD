@@ -86,6 +86,8 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         adapter_epochs: int = 1,
         adapter_steps: int = 20,
         server_test_loader: DataLoader | None = None,
+        use_consensus: bool = False,
+        use_per_family_generators: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -121,19 +123,39 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         # FedGen generator trainer (server-side, latent-space)
         fedgen_cfg = fedgen_config or {}
         self._device = fedgen_cfg.get("device", "cpu")
-        if self.generator is not None and self.enable_fedgen:
-            self.generator_trainer = AFADGeneratorTrainer(
-                generator=self.generator,
-                gen_lr=fedgen_cfg.get("gen_lr", 3e-4),
-                batch_size=fedgen_cfg.get("batch_size", 128),
-                ensemble_alpha=fedgen_cfg.get("ensemble_alpha", 1.0),
-                ensemble_eta=fedgen_cfg.get("ensemble_eta", 1.0),
-                device=self._device,
-            )
-        else:
-            self.generator_trainer = None
         self._gen_epochs = fedgen_cfg.get("gen_epochs", 1)
         self._gen_teacher_iters = fedgen_cfg.get("teacher_iters", 20)
+
+        # Per-family generator mode: one generator + trainer per model family.
+        # Each generator trains only on its family's classifiers, aligning
+        # its latent space to that family's bottleneck distribution.
+        self._use_per_family_generators = use_per_family_generators
+        self.family_generators: dict[str, FedGenGenerator] = {}
+        self.family_generator_trainers: dict[str, AFADGeneratorTrainer] = {}
+
+        if self.generator is not None and self.enable_fedgen:
+            if use_per_family_generators:
+                # Create one generator + trainer per family (populated lazily
+                # at first training call once client_family_map is known)
+                self._pending_generator_init = True
+                self.generator_trainer = None
+            else:
+                self.generator_trainer = AFADGeneratorTrainer(
+                    generator=self.generator,
+                    gen_lr=fedgen_cfg.get("gen_lr", 3e-4),
+                    batch_size=fedgen_cfg.get("batch_size", 128),
+                    ensemble_alpha=fedgen_cfg.get("ensemble_alpha", 1.0),
+                    ensemble_eta=fedgen_cfg.get("ensemble_eta", 1.0),
+                    device=self._device,
+                    s_cfc_gamma=fedgen_cfg.get("s_cfc_gamma", 0.0),
+                )
+                self._pending_generator_init = False
+        else:
+            self.generator_trainer = None
+            self._pending_generator_init = False
+
+        # Store fedgen_cfg for lazy generator init
+        self._fedgen_cfg = fedgen_cfg
 
         # Training config to propagate to clients
         self.training_config = training_config or {}
@@ -149,6 +171,11 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
         # Track whether generator has been trained at least once
         self._generator_trained = False
+
+        # Cross-family consensus labels: [num_classes, num_classes] np.float32
+        # Recomputed each round after generator training when use_consensus=True.
+        self._consensus_labels: np.ndarray | None = None
+        self._use_consensus = use_consensus
 
         # For Flower's return value (keep one set of params)
         self._global_params_for_flower: list[np.ndarray] | None = None
@@ -270,12 +297,103 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
         return metrics
 
+    def _initialize_per_family_generators(self) -> None:
+        """Lazily create one generator + trainer per family (called once)."""
+        if not self._pending_generator_init:
+            return
+        if self.generator is None:
+            return
+
+        families = set(self.client_family_map.values()) | set(self.family_model_names.keys())
+        for family in families:
+            if family in self.family_generators:
+                continue
+            # Copy architecture from the shared generator template
+            gen = FedGenGenerator(
+                noise_dim=self.generator.noise_dim,
+                num_classes=self.num_classes,
+                latent_dim=self.generator.latent_dim,
+            ).to(self._device)
+            trainer = AFADGeneratorTrainer(
+                generator=gen,
+                gen_lr=self._fedgen_cfg.get("gen_lr", 3e-4),
+                batch_size=self._fedgen_cfg.get("batch_size", 128),
+                ensemble_alpha=self._fedgen_cfg.get("ensemble_alpha", 1.0),
+                ensemble_eta=self._fedgen_cfg.get("ensemble_eta", 1.0),
+                device=self._device,
+            )
+            self.family_generators[family] = gen
+            self.family_generator_trainers[family] = trainer
+            logger.info(f"Created per-family generator for: {family}")
+
+        self._pending_generator_init = False
+
     def _serialize_generator_params(self) -> bytes | None:
-        """Serialize generator params as bytes for Flower config."""
+        """Serialize shared generator params as bytes for Flower config."""
         if self.generator is None:
             return None
         gen_params = [val.cpu().numpy() for val in self.generator.state_dict().values()]
         return pickle.dumps(gen_params)
+
+    def _serialize_family_generator_params(self, family: str) -> bytes | None:
+        """Serialize per-family generator params as bytes for Flower config."""
+        gen = self.family_generators.get(family)
+        if gen is None:
+            return None
+        trainer = self.family_generator_trainers.get(family)
+        if trainer is not None:
+            state_dict = trainer.get_inference_state_dict()
+        else:
+            state_dict = gen.state_dict()
+        params = [val.cpu().numpy() for val in state_dict.values()]
+        return pickle.dumps(params)
+
+    def _compute_consensus_labels(self) -> np.ndarray | None:
+        """Compute per-class soft labels averaged across all family classifiers.
+
+        For each class c, generates z = G(c) and averages softmax predictions
+        from every family's rate=1.0 global model's classifier layer.
+        All families share the same latent_dim, so no adapter is needed.
+
+        Returns:
+            Float32 array of shape [num_classes, num_classes], or None if
+            fewer than 2 families are available.
+        """
+        if not self.enable_fedgen or self.generator is None:
+            return None
+        if len(self.family_global_models) < 2:
+            return None
+
+        import torch.nn.functional as F  # local import avoids circular risk
+
+        device = torch.device(self._device)
+        self.generator.eval()
+
+        consensus = np.zeros((self.num_classes, self.num_classes), dtype=np.float32)
+
+        with torch.no_grad():
+            for c in range(self.num_classes):
+                y = torch.tensor([c], dtype=torch.long, device=device)
+                z = self.generator(y)["output"]  # [1, latent_dim]
+
+                logits_sum = torch.zeros(1, self.num_classes, device=device)
+                count = 0
+                for family, np_params in self.family_global_models.items():
+                    model_name = self.family_model_names.get(family)
+                    if not model_name:
+                        continue
+                    model = self._reconstruct_model(model_name, np_params)
+                    if model is None:
+                        continue
+                    model.eval()
+                    logits = model.forward_from_latent(z)  # [1, num_classes]
+                    logits_sum += F.softmax(logits, dim=1)
+                    count += 1
+
+                if count > 0:
+                    consensus[c] = (logits_sum / count).squeeze(0).cpu().numpy()
+
+        return consensus
 
     # ─── Flower overrides ─────────────────────────────────────────
 
@@ -304,14 +422,21 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         if not standard_fit_ins:
             return []
 
-        # Serialize generator params once for all clients
-        gen_params_bytes = None
+        # Serialize generator params (shared or per-family)
+        gen_params_bytes = None  # shared mode: same bytes for all clients
+        family_gen_bytes: dict[str, bytes] = {}  # per-family mode: keyed by family
         if (
             self.enable_fedgen
             and self._generator_trained
             and server_round > FEDGEN_WARMUP_ROUNDS
         ):
-            gen_params_bytes = self._serialize_generator_params()
+            if self._use_per_family_generators:
+                for fam in self.family_generators:
+                    b = self._serialize_family_generator_params(fam)
+                    if b is not None:
+                        family_gen_bytes[fam] = b
+            else:
+                gen_params_bytes = self._serialize_generator_params()
 
         # Pre-serialize per-family adapter params (avoids repeated serialization)
         family_adapter_bytes: dict[str, bytes] = {}
@@ -320,6 +445,11 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 family_adapter_bytes[family] = (
                     self.family_adapter_bank.serialize_family(family)
                 )
+
+        # Serialize consensus labels once (small array: num_classes × num_classes)
+        consensus_bytes = None
+        if self._use_consensus and self._consensus_labels is not None:
+            consensus_bytes = pickle.dumps(self._consensus_labels)
 
         new_fit_ins = []
         for client, fit_ins in standard_fit_ins:
@@ -351,13 +481,19 @@ class AFADStrategy(fl.server.strategy.FedAvg):
                 and server_round > FEDGEN_WARMUP_ROUNDS
             )
 
-            # Send generator params to clients (AFAD/FedGen modes)
-            if gen_params_bytes is not None:
+            # Send generator params to clients (shared or per-family)
+            if family_gen_bytes and family in family_gen_bytes:
+                new_config["generator_params"] = family_gen_bytes[family]
+            elif gen_params_bytes is not None:
                 new_config["generator_params"] = gen_params_bytes
 
             # Send family-specific adapter params if available
             if family and family in family_adapter_bytes:
                 new_config["adapter_params"] = family_adapter_bytes[family]
+
+            # Send cross-family consensus labels if available
+            if consensus_bytes is not None:
+                new_config["consensus_labels"] = consensus_bytes
 
             # Determine model parameters to send
             if self.enable_heterofl and family and family in self.family_global_models:
@@ -434,6 +570,10 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         ):
             self._train_generator_on_server(server_round)
 
+        # Recompute cross-family consensus labels after generator training
+        if self._use_consensus and self._generator_trained:
+            self._consensus_labels = self._compute_consensus_labels()
+
         # Metrics
         metrics: dict[str, Scalar] = {
             "round": server_round,
@@ -504,8 +644,41 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
             logger.info(f"Family {family}: FedAvg aggregated {len(items)} clients")
 
+    def _build_family_label_weights(
+        self, torch_models: dict[str, nn.Module]
+    ) -> tuple[np.ndarray, list[int]]:
+        """Compute label weights and qualified labels for given models dict."""
+        family_label_counts: dict[str, list[int]] = {}
+        for cid, counts in self.client_label_counts.items():
+            fam = self.client_family_map.get(cid)
+            if fam and fam in torch_models:
+                if fam not in family_label_counts:
+                    family_label_counts[fam] = [0] * self.num_classes
+                for i, c in enumerate(counts):
+                    if i < self.num_classes:
+                        family_label_counts[fam][i] += c
+
+        label_counts_list = [
+            family_label_counts.get(f, [0] * self.num_classes) for f in torch_models
+        ]
+        has_any_data = any(any(c > 0 for c in counts) for counts in label_counts_list)
+
+        if not has_any_data:
+            n = len(torch_models)
+            return np.ones((self.num_classes, n)) / n, list(range(self.num_classes))
+
+        # Use any trainer's get_label_weights (static helper)
+        trainer = self.generator_trainer or next(
+            iter(self.family_generator_trainers.values()), None
+        )
+        if trainer is None:
+            n = len(torch_models)
+            return np.ones((self.num_classes, n)) / n, list(range(self.num_classes))
+
+        return trainer.get_label_weights(label_counts_list, num_classes=self.num_classes)
+
     def _train_generator_on_server(self, server_round: int) -> None:
-        """Reconstruct FedGenModelWrapper models and train generator."""
+        """Reconstruct FedGenModelWrapper models and train generator(s)."""
         if not self.model_factories:
             logger.warning("No model_factories; skipping generator training")
             return
@@ -520,63 +693,64 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             if model is not None:
                 torch_models[family] = model
 
-        if len(torch_models) < 2:
-            logger.info("Not enough models for generator training")
+        if not torch_models:
+            logger.info("No models available for generator training")
             return
 
-        # Compute label weights (aggregate per-client counts to per-family)
-        family_label_counts: dict[str, list[int]] = {}
-        for cid, counts in self.client_label_counts.items():
-            family = self.client_family_map.get(cid)
-            if family and family in torch_models:
-                if family not in family_label_counts:
-                    family_label_counts[family] = [0] * self.num_classes
-                for i, c in enumerate(counts):
-                    if i < self.num_classes:
-                        family_label_counts[family][i] += c
-
-        # Build label_counts_list aligned with torch_models order.
-        # Use zeros for families that have no clients (e.g. vit in a cnn-only run).
-        label_counts_list = [
-            family_label_counts.get(f, [0] * self.num_classes) for f in torch_models
-        ]
-        has_any_data = any(any(c > 0 for c in counts) for counts in label_counts_list)
-
-        if not has_any_data:
-            num_models = len(torch_models)
-            label_weights = np.ones((self.num_classes, num_models)) / num_models
-            qualified_labels = list(range(self.num_classes))
+        if self._use_per_family_generators:
+            # Per-family mode: train G_cnn on CNN only, G_vit on ViT only.
+            # Each generator's latent space aligns to its family's bottleneck.
+            self._initialize_per_family_generators()
+            for family, model in torch_models.items():
+                trainer = self.family_generator_trainers.get(family)
+                if trainer is None:
+                    continue
+                single_model = {family: model}
+                label_weights, qualified_labels = self._build_family_label_weights(
+                    single_model
+                )
+                trainer.train_generator(
+                    models=single_model,
+                    label_weights=label_weights,
+                    qualified_labels=qualified_labels,
+                    num_epochs=self._gen_epochs,
+                    num_teacher_iters=self._gen_teacher_iters,
+                )
+                logger.info(f"Per-family generator trained: {family}")
         else:
-            label_weights, qualified_labels = self.generator_trainer.get_label_weights(
-                label_counts_list, num_classes=self.num_classes
+            # Shared generator mode: train on all families together
+            if len(torch_models) < 2:
+                logger.info("Not enough models for shared generator training")
+                return
+
+            label_weights, qualified_labels = self._build_family_label_weights(
+                torch_models
             )
-
-        # Train generator using forward_from_latent
-        self.generator_trainer.train_generator(
-            models=torch_models,
-            label_weights=label_weights,
-            qualified_labels=qualified_labels,
-            num_epochs=self._gen_epochs,
-            num_teacher_iters=self._gen_teacher_iters,
-        )
-
-        self._generator_trained = True
-        logger.info(f"Generator trained with {len(torch_models)} family models")
-
-        # Train per-family adapters after generator update (frozen generator)
-        if self.family_adapter_bank is not None and self.generator_trainer is not None:
-            self.generator_trainer.train_adapters(
+            self.generator_trainer.train_generator(
                 models=torch_models,
-                adapter_bank=self.family_adapter_bank,
                 label_weights=label_weights,
                 qualified_labels=qualified_labels,
-                num_epochs=self._adapter_epochs,
-                num_steps=self._adapter_steps,
+                num_epochs=self._gen_epochs,
+                num_teacher_iters=self._gen_teacher_iters,
             )
-            self._adapters_trained = True
-            logger.info(
-                f"Adapters trained for families: {list(self.family_adapter_bank.get_families())}"
-            )
+
+            # Train per-family adapters after generator update
+            if self.family_adapter_bank is not None:
+                self.generator_trainer.train_adapters(
+                    models=torch_models,
+                    adapter_bank=self.family_adapter_bank,
+                    label_weights=label_weights,
+                    qualified_labels=qualified_labels,
+                    num_epochs=self._adapter_epochs,
+                    num_steps=self._adapter_steps,
+                )
+                self._adapters_trained = True
+                logger.info(
+                    f"Adapters trained: {list(self.family_adapter_bank.get_families())}"
+                )
+
+        self._generator_trained = True
+        logger.info(f"Generator(s) trained with {len(torch_models)} family model(s)")
 
     def configure_evaluate(
         self,

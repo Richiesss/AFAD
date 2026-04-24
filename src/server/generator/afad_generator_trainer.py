@@ -99,6 +99,7 @@ class AFADGeneratorTrainer:
         ensemble_eta: float = 1.0,
         device: str = "cpu",
         ema_decay: float = 0.999,
+        s_cfc_gamma: float = 0.0,
     ):
         self.generator = generator
         self.gen_lr = gen_lr
@@ -107,6 +108,7 @@ class AFADGeneratorTrainer:
         self.ensemble_eta = ensemble_eta
         self.device = device
         self.ema_decay = ema_decay
+        self.s_cfc_gamma = s_cfc_gamma
         self.generator.to(device)
         self.gen_optimizer = torch.optim.Adam(self.generator.parameters(), lr=gen_lr)
         self.ema_tracker = (
@@ -188,8 +190,8 @@ class AFADGeneratorTrainer:
         Returns:
             Average training loss.
         """
-        if len(models) < 2:
-            logger.info("Skipping generator training: need >= 2 models")
+        if not models:
+            logger.info("Skipping generator training: no models provided")
             return 0.0
 
         logger.info(
@@ -224,6 +226,8 @@ class AFADGeneratorTrainer:
 
                 # Teacher loss: weighted CE across all family models
                 teacher_loss = torch.tensor(0.0, device=self.device)
+                # Collect softmax predictions for S-CFC consensus loss
+                all_probs: list[torch.Tensor] = []
 
                 for model_idx, model in enumerate(model_list):
                     weight = label_weights[y, model_idx]
@@ -238,13 +242,29 @@ class AFADGeneratorTrainer:
                     per_sample_loss = self.generator.crossentropy_loss(logp, y_input)
                     teacher_loss += torch.mean(per_sample_loss * weight_tensor)
 
+                    if self.s_cfc_gamma > 0:
+                        all_probs.append(F.softmax(logits, dim=1))
+
                 # Diversity loss
                 diversity_loss = self.generator.diversity_loss(eps, gen_output)
+
+                # S-CFC: cross-family consensus loss
+                # Forces generator to find anchor points where all classifiers agree,
+                # directly attacking z-space fragmentation between CNN and ViT families.
+                # L_CFC = (1/K) * sum_k KL(p_k || mean_p)
+                cfc_loss = torch.tensor(0.0, device=self.device)
+                if self.s_cfc_gamma > 0 and len(all_probs) > 1:
+                    mean_prob = torch.stack(all_probs).mean(dim=0)  # [B, C]
+                    log_mean = mean_prob.clamp(min=1e-8).log()
+                    for prob_k in all_probs:
+                        cfc_loss += F.kl_div(log_mean, prob_k, reduction="batchmean")
+                    cfc_loss = cfc_loss / len(all_probs)
 
                 # Total loss
                 loss = (
                     self.ensemble_alpha * teacher_loss
                     + self.ensemble_eta * diversity_loss
+                    + self.s_cfc_gamma * cfc_loss
                 )
 
                 loss.backward()

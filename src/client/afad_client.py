@@ -8,8 +8,18 @@ Training loss:
   L = CE(model(x), y)                                       # predictive
     + alpha * CE(classifier(G(y_rand)), y_rand)              # teacher
     + beta  * KL(model(x) || classifier(G(y_real)))          # latent matching
+    + relkd_scale * MSE(S_gen, S_real)                       # relational KD (optional)
+    + consensus_scale * KL(classifier(G(y)) || consensus[y]) # cross-family consensus (optional)
 
 where alpha=10, beta=10, decaying by 0.98/round.
+
+Relational KD: matches pairwise cosine similarity between real-data logits
+(backbone detached) and generated logits, preserving relational structure
+without interfering with HeteroFL backbone aggregation.
+
+Cross-family Consensus: server distributes per-class soft labels averaged
+across CNN and ViT family classifiers; client aligns generated logits to
+this consensus, bridging the inter-family representation gap.
 """
 
 import pickle
@@ -65,6 +75,18 @@ class AFADClient(fl.client.NumPyClient):
         generative_alpha: Teacher loss weight.
         generative_beta: Latent matching loss weight.
         gen_batch_size: Batch size for generated samples.
+        relkd_scale: Weight for Relational KD loss (0.0 = disabled).
+            Matches pairwise cosine similarity matrices between real-data
+            logits (backbone detached) and generated logits.
+        consensus_scale: Weight for Cross-family Consensus KL loss (0.0 = disabled).
+            Aligns generated logits to server-computed per-class soft labels
+            that average CNN and ViT family classifiers.
+        backbone_align_scale: Weight for Backbone-Generator Alignment MSE loss (0.0 = disabled).
+            Directly aligns backbone+bottleneck output (z_real) to generator's
+            latent z_gen for the same labels, training the backbone to produce
+            features consistent with the generator's latent space.
+            This addresses the backbone-bypass structural gap: current FedGen KD
+            only trains the classifier; this term propagates signal into the backbone.
     """
 
     def __init__(
@@ -87,6 +109,10 @@ class AFADClient(fl.client.NumPyClient):
         generative_beta: float = DEFAULT_GENERATIVE_BETA,
         gen_batch_size: int = 32,
         family_adapter: nn.Module | None = None,
+        missing_label_ratio: float = 0.0,
+        relkd_scale: float = 0.0,
+        consensus_scale: float = 0.0,
+        backbone_align_scale: float = 0.0,
     ):
         self.cid = cid
         self.model = model
@@ -110,10 +136,17 @@ class AFADClient(fl.client.NumPyClient):
         self.generative_alpha = generative_alpha
         self.generative_beta = generative_beta
         self.gen_batch_size = gen_batch_size
+        self.missing_label_ratio = missing_label_ratio
+        self.relkd_scale = relkd_scale
+        self.consensus_scale = consensus_scale
+        # Populated each round from server config["consensus_labels"]
+        self.consensus_labels: np.ndarray | None = None
+        self.backbone_align_scale = backbone_align_scale
 
         # Precompute label counts and available labels
         self.label_counts = self._compute_label_counts()
         self.available_labels = [i for i, c in enumerate(self.label_counts) if c > 0]
+        self.missing_labels = [i for i in range(self.num_classes) if i not in self.available_labels]
 
         logger.info(
             f"Client {cid} initialized: model={model_name}, device={self.device}, "
@@ -227,6 +260,11 @@ class AFADClient(fl.client.NumPyClient):
             adapter_params = pickle.loads(adapter_params_bytes)  # noqa: S301
             self.set_adapter_parameters(adapter_params)
 
+        # Update cross-family consensus labels if provided
+        consensus_bytes = config.get("consensus_labels", None)
+        if isinstance(consensus_bytes, bytes):
+            self.consensus_labels = pickle.loads(consensus_bytes)  # noqa: S301
+
         glob_iter = config.get("round", 0)
         regularization = config.get("regularization", glob_iter > 0)
 
@@ -311,10 +349,26 @@ class AFADClient(fl.client.NumPyClient):
                     alpha = self.generative_alpha * (DECAY_RATE**glob_iter)
                     beta = self.generative_beta * (DECAY_RATE**glob_iter)
 
-                    # Teacher loss: CE on generated latents with random labels
-                    sampled_y = np.random.choice(
-                        self.available_labels, self.gen_batch_size
+                    # Teacher loss: CE on generated latents with random labels.
+                    # When missing_label_ratio > 0, mix in a small fraction of
+                    # classes absent from local data so the classifier learns
+                    # to respond to all classes (FedGen's core Non-IID fix).
+                    # Missing-class samples use alpha * 0.1 to avoid destabilising
+                    # HeteroFL aggregation (which ignores unseen-class classifier rows).
+                    n_missing_samples = (
+                        max(1, int(self.gen_batch_size * self.missing_label_ratio))
+                        if self.missing_labels and self.missing_label_ratio > 0.0
+                        else 0
                     )
+                    n_avail_samples = self.gen_batch_size - n_missing_samples
+
+                    sampled_y = np.random.choice(self.available_labels, n_avail_samples)
+                    if n_missing_samples > 0:
+                        sampled_missing = np.random.choice(
+                            self.missing_labels, n_missing_samples
+                        )
+                        sampled_y = np.concatenate([sampled_y, sampled_missing])
+
                     sampled_y_t = torch.tensor(
                         sampled_y, dtype=torch.long, device=self.device
                     )
@@ -326,9 +380,15 @@ class AFADClient(fl.client.NumPyClient):
 
                     gen_logits = self.model.forward_from_latent(gen_latent)
                     gen_logp = F.log_softmax(gen_logits, dim=1)
-                    teacher_loss = alpha * torch.mean(
-                        FedGenGenerator.crossentropy_loss(gen_logp, sampled_y_t)
-                    )
+
+                    # Per-sample CE: available labels at full alpha, missing at 0.1x
+                    per_sample_ce = FedGenGenerator.crossentropy_loss(gen_logp, sampled_y_t)
+                    if n_missing_samples > 0:
+                        weights = torch.ones(self.gen_batch_size, device=self.device)
+                        weights[n_avail_samples:] = 0.1
+                        teacher_loss = alpha * torch.mean(per_sample_ce * weights)
+                    else:
+                        teacher_loss = alpha * torch.mean(per_sample_ce)
 
                     # Latent matching: KL(real output || generated output)
                     with torch.no_grad():
@@ -346,6 +406,61 @@ class AFADClient(fl.client.NumPyClient):
 
                     gen_ratio = self.gen_batch_size / images.size(0)
                     loss = loss + gen_ratio * teacher_loss + latent_loss
+
+                    # Backbone-Generator Alignment: align backbone+bottleneck output
+                    # (z_real) to generator's latent z_gen for the same labels.
+                    # This directly trains the backbone with generator signal,
+                    # addressing the backbone-bypass structural gap where standard
+                    # FedGen KD only updates the classifier layer.
+                    # Unlike RelKD (backbone detached), this intentionally propagates
+                    # gradients through the backbone — the distillation target z_gen
+                    # is fixed (no_grad), so HeteroFL aggregation is not disrupted.
+                    if self.backbone_align_scale > 0:
+                        z_real = self.model.bottleneck(self.model.backbone(images))
+                        with torch.no_grad():
+                            gen_out_ba = self.generator(labels)
+                            z_gen_ba = gen_out_ba["output"]
+                            if self.family_adapter is not None:
+                                z_gen_ba = self.family_adapter(z_gen_ba)
+                        backbone_align_loss = self.backbone_align_scale * F.mse_loss(
+                            z_real, z_gen_ba
+                        )
+                        loss = loss + backbone_align_loss
+
+                    # Relational KD: match pairwise cosine similarity between
+                    # real-data logits (backbone detached) and generated logits.
+                    # Backbone detach prevents HeteroFL aggregation disruption.
+                    if self.relkd_scale > 0:
+                        with torch.no_grad():
+                            real_feat = self.model.backbone(images)
+                        real_logits_bd = self.model.classifier(
+                            self.model.bottleneck(real_feat)
+                        )
+                        with torch.no_grad():
+                            gen_out_rk = self.generator(labels)
+                            gen_z_rk = gen_out_rk["output"]
+                            if self.family_adapter is not None:
+                                gen_z_rk = self.family_adapter(gen_z_rk)
+                        gen_logits_rk = self.model.forward_from_latent(gen_z_rk)
+
+                        real_n = F.normalize(real_logits_bd.detach(), p=2, dim=1)
+                        gen_n = F.normalize(gen_logits_rk, p=2, dim=1)
+                        S_real = real_n @ real_n.T  # [B, B]
+                        S_gen = gen_n @ gen_n.T     # [B, B]
+                        relkd_loss = self.relkd_scale * F.mse_loss(S_gen, S_real)
+                        loss = loss + relkd_loss
+
+                    # Cross-family Consensus: align generated logits to server-side
+                    # per-class soft labels averaged from CNN + ViT classifiers.
+                    if self.consensus_scale > 0 and self.consensus_labels is not None:
+                        consensus_t = torch.tensor(
+                            self.consensus_labels, dtype=torch.float32, device=self.device
+                        )  # [num_classes, num_classes]
+                        target_consensus = consensus_t[sampled_y_t]  # [gen_batch, C]
+                        consensus_loss = self.consensus_scale * F.kl_div(
+                            gen_logp, target_consensus, reduction="batchmean"
+                        )
+                        loss = loss + consensus_loss
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)

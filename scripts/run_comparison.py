@@ -250,6 +250,10 @@ def afad_client_fn_builder(
     num_classes: int,
     local_epochs: int,
     cid_to_rate: dict[str, float],
+    missing_label_ratio: float = 0.0,
+    relkd_scale: float = 0.0,
+    consensus_scale: float = 0.0,
+    backbone_align_scale: float = 0.0,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -295,6 +299,10 @@ def afad_client_fn_builder(
             num_classes=num_classes,
             generative_alpha=kd_scale,
             generative_beta=kd_scale,
+            missing_label_ratio=missing_label_ratio,
+            relkd_scale=relkd_scale,
+            consensus_scale=consensus_scale,
+            backbone_align_scale=backbone_align_scale,
         ).to_client()
 
     return client_fn
@@ -379,6 +387,9 @@ def _build_strategy(
     fedgen_cfg: dict | None = None,
     use_adapters: bool = False,
     server_test_loader=None,
+    use_consensus: bool = False,
+    use_per_family_generators: bool = False,
+    s_cfc_gamma: float = 0.0,
 ) -> AFADStrategy:
     """Build AFADStrategy with appropriate configuration."""
     device = get_device()
@@ -433,6 +444,7 @@ def _build_strategy(
         "gen_epochs": fedgen_cfg.get("gen_epochs", 2),
         "teacher_iters": fedgen_cfg.get("teacher_iters", 25),
         "device": device,
+        "s_cfc_gamma": s_cfc_gamma,
     }
 
     training_config = {
@@ -469,6 +481,8 @@ def _build_strategy(
         num_classes=num_classes,
         family_adapter_bank=adapter_bank,
         server_test_loader=server_test_loader,
+        use_consensus=use_consensus,
+        use_per_family_generators=use_per_family_generators,
         min_fit_clients=num_clients,
         min_available_clients=num_clients,
         fraction_fit=1.0,
@@ -502,6 +516,13 @@ def run_single_experiment(
     training_cfg: dict | None = None,
     fedgen_cfg: dict | None = None,
     use_adapters: bool = False,
+    missing_label_ratio: float = 0.0,
+    relkd_scale: float = 0.0,
+    consensus_scale: float = 0.0,
+    use_consensus: bool = False,
+    use_per_family_generators: bool = False,
+    backbone_align_scale: float = 0.0,
+    s_cfc_gamma: float = 0.0,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -533,6 +554,9 @@ def run_single_experiment(
         fedgen_cfg=fedgen_cfg,
         use_adapters=use_adapters,
         server_test_loader=test_loader,
+        use_consensus=use_consensus,
+        use_per_family_generators=use_per_family_generators,
+        s_cfc_gamma=s_cfc_gamma,
     )
 
     # Build client_fn based on experiment mode
@@ -548,7 +572,7 @@ def run_single_experiment(
             cid_to_rate,
         )
     elif enable_heterofl and enable_fedgen:
-        # AFAD Hybrid
+        # AFAD Hybrid (+ optional RelKD / Consensus)
         client_fn = afad_client_fn_builder(
             train_loaders,
             test_loader,
@@ -557,6 +581,10 @@ def run_single_experiment(
             num_classes,
             local_epochs,
             cid_to_rate,
+            missing_label_ratio=missing_label_ratio,
+            relkd_scale=relkd_scale,
+            consensus_scale=consensus_scale,
+            backbone_align_scale=backbone_align_scale,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -779,7 +807,13 @@ def main():
         logger.info(f"Loaded existing results from {args.load}: {list(results.keys())}")
 
     # Determine which methods to run
-    all_methods = ["HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Adapter"]
+    all_methods = [
+        "HeteroFL Only", "FedGen Only", "AFAD Hybrid", "AFAD + Adapter",
+        "AFAD + AvailLabels",
+        "AFAD + RelKD", "AFAD + Consensus", "AFAD + RelKD + Consensus",
+        "AFAD + PerFamilyGen",
+        "AFAD + BackboneAlign",
+    ]
     if args.methods:
         methods_to_run = [m.strip() for m in args.methods.split(",")]
     else:
@@ -791,6 +825,75 @@ def main():
         "FedGen Only":    {"enable_fedgen": True,  "enable_heterofl": False, "use_adapters": False},
         "AFAD Hybrid":    {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": False},
         "AFAD + Adapter": {"enable_fedgen": True,  "enable_heterofl": True,  "use_adapters": True},
+        # available_labels expansion: 5% of teacher-loss batch from classes absent in local data
+        # Activates FedGen's original Non-IID mechanism (class補完) that was silently disabled.
+        # Missing-class alpha is 0.1x to avoid destabilising HeteroFL classifier aggregation.
+        "AFAD + AvailLabels": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "missing_label_ratio": 0.05,
+        },
+        # Relational KD: matches pairwise cosine similarity between real-data logits
+        # (backbone detached) and generated logits. Scale=1.0 preserves relational
+        # structure in the classifier without disrupting HeteroFL backbone aggregation.
+        "AFAD + RelKD": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "relkd_scale": 1.0,
+        },
+        # Cross-family Consensus: server distributes per-class soft labels averaged
+        # from CNN + ViT classifiers. Client aligns generated logits to this consensus,
+        # bridging the inter-family representation gap.
+        "AFAD + Consensus": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "use_consensus": True, "consensus_scale": 1.0,
+        },
+        # Combined: both RelKD and Cross-family Consensus.
+        "AFAD + RelKD + Consensus": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "relkd_scale": 1.0,
+            "use_consensus": True, "consensus_scale": 1.0,
+        },
+        # Per-family generators: G_cnn trains on CNN classifiers only,
+        # G_vit trains on ViT classifiers only. Each client receives its
+        # family-specific generator, eliminating cross-family z-space
+        # misalignment (~6pp structural gap in shared-generator mode).
+        "AFAD + PerFamilyGen": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "use_per_family_generators": True,
+        },
+        # Backbone-Generator Alignment: aligns backbone+bottleneck output (z_real)
+        # to generator's latent z_gen for the same labels via MSE loss.
+        # Unlike RelKD (backbone detached), this directly propagates generator
+        # signal into the backbone, addressing the backbone-bypass structural gap.
+        # scale=0.1 is conservative to avoid CE/alignment conflict.
+        "AFAD + BackboneAlign": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "backbone_align_scale": 0.1,
+        },
+        # BackboneAlign with higher scale to push more gradient into backbone.
+        "AFAD + BackboneAlign (scale=0.3)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "backbone_align_scale": 0.3,
+        },
+        # BackboneAlign + RelKD: backbone alignment + relational structure matching.
+        # Complementary mechanisms: BackboneAlign trains backbone directly,
+        # RelKD preserves relational structure in logit space.
+        "AFAD + BackboneAlign + RelKD": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "backbone_align_scale": 0.1, "relkd_scale": 1.0,
+        },
+        # S-CFC: Server-side Cross-Family Consensus loss added to generator training.
+        # Forces generator to find "universal anchor points" where CNN and ViT classifiers
+        # agree semantically, directly attacking z-space fragmentation at its source.
+        # gamma=0.1: conservative to avoid generator collapse.
+        "AFAD + S-CFC (gamma=0.1)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "s_cfc_gamma": 0.1,
+        },
+        # S-CFC with stronger consensus pressure.
+        "AFAD + S-CFC (gamma=0.3)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "s_cfc_gamma": 0.3,
+        },
     }
 
     for method in methods_to_run:
