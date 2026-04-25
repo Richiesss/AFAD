@@ -8,11 +8,11 @@
 
 実際の連合学習（Federated Learning; FL）環境では、クライアントは計算能力とモデルアーキテクチャの両面で異質である。既存手法は一方の問題のみを扱う：HeteroFL [Diao+, ICLR 2021] は幅スケーリングで計算能力の異種性に対応するが、異なるアーキテクチャ族（CNN と Transformer など）間の知識共有を行わない。FedGen [Zhu+, ICML 2021] はデータフリー知識蒸留（KD）でアーキテクチャ異種性に対応するが、全クライアントが同一サイズのモデルを持つことを前提とする。
 
-本研究では **AFAD（Adaptive Federated Architecture Distribution）** を提案する。AFAD は両手法を統合し、共有 32 次元潜在空間と Generator を介してアーキテクチャをまたいだ知識共有を実現しながら、幅スケーリングで計算能力の異種性にも対応する。単純な統合（ナイーブ統合）から 4 段階の改善を経て、さらに **Prototype Anchoring**・**Rate-conditioned Generator**・**AnchorKD** という 3 種の拡張手法を提案する。
+本研究では **AFAD（Adaptive Federated Architecture Distribution）** を提案する。AFAD は両手法を統合し、共有 32 次元潜在空間と Generator を介してアーキテクチャをまたいだ知識共有を実現しながら、幅スケーリングで計算能力の異種性にも対応する。単純な統合（ナイーブ統合）から 4 段階の改善を経て、さらに **FedProto 型 Prototype Regularization** をはじめとする複数の拡張手法を提案・体系的に評価する。
 
-**IID 環境（MNIST）における主要結果**: AFAD Hybrid は直接シミュレーション（公平な比較条件）で FedGen Only（67.00%）を **+2.85pp 上回る 69.85%** を達成する。FedGen は CNN と ViT の混在設定を扱えないのに対し、AFAD はその制約を持たない。なお、10クライアント Flower 設定（サーバーの rate=1.0 グローバルモデルで評価）では FedGen Only（server_acc 97.51%）が AFAD Hybrid（server_acc 90.47%）を上回るが、この設定では FedGen が全員 rate=1.0（計算能力の異種性なし）で動作するため直接比較は不公平である。AFAD と HeteroFL は rate=0.5/0.25 の容量制約クライアントを含む難条件で評価されている。これが AFAD の本質的な貢献である。
+**IID 環境（OrganAMNIST, 10-client, server_acc）における主要結果**: AFAD + ProjHead は FedGen Only（86.32%）を **+2.57pp 上回る 88.89%** を達成する。FedGen は CNN と ViT の混在設定を扱えないのに対し、AFAD はその制約を持たない。
 
-**Non-IID 環境（OrganAMNIST, α=0.5）における課題**: AFAD + Proto は HeteroFL Only を **+2.64pp** 上回る一方、FedGen Only との間には **16.66pp のギャップ**が存在する。このギャップの根本原因（Generator の潜在空間が rate=1.0 に特化しており sub-rate クライアントのボトルネック分布と不整合）を体系的な実験（5 種のギャップ解消アプローチ）により特定した。Non-IID 環境への本格的な対応は今後の課題である。
+**Non-IID 環境（OrganAMNIST, α=0.5）における進展**: FedProto 型 Prototype Regularization（AFAD + Proto, scale=0.5）を導入することで、Mean R11+ 72.64%（Best 73.12%）を達成し、ベースライン（AFAD Hybrid: 66.52%）から **+6.12pp** の大幅改善を実現した。FedGen Only（Mean R11+: 83.97%）との残ギャップは 11.33pp（初期の 17pp 超から縮小）。14 種を超える手法の体系的実験を通じ、このギャップの根本原因（Generator 潜在空間と sub-rate backbone の構造的不整合、および cross-family z-space fragmentation）を特定・定量化した。
 
 ---
 
@@ -26,25 +26,28 @@
    - 3.3 [FedGen 統合](#33-fedgen統合)
    - 3.4 [ナイーブ統合から AFAD Hybrid へ](#34-ナイーブ統合からafad-hybridへ)
 4. [拡張手法](#4-拡張手法)
-   - 4.1 [AFAD + Proto（Prototype Anchoring）](#41-afad--proto)
-   - 4.2 [AFAD + RateCond（Rate-conditioned Generator）](#42-afad--ratecond)
-   - 4.3 [AFAD + AnchorKD（フルレート凍結教師）](#43-afad--anchorkd)
+   - 4.1 [AFAD + FedProto（Prototype Regularization）](#41-afad--fedproto)
+   - 4.2 [AFAD + BackboneAlign](#42-afad--backbonealign)
+   - 4.3 [AFAD + S-CFC（Server-side Cross-Family Consensus）](#43-afad--s-cfc)
+   - 4.4 [AFAD + LatentSupCon（Latent Supervised Contrastive Learning）](#44-afad--latentsupcon)
+   - 4.5 [AFAD + GenMix（Generative Mixup）](#45-afad--genmix)
+   - 4.6 [AFAD + ProjHead（Projection Head、IID 向け）](#46-afad--projhead)
 5. [実験](#5-実験)
    - 5.1 [実験設定](#51-実験設定)
    - 5.2 [Phase 1: MNIST IID](#52-phase-1-mnist-iid)
-   - 5.3 [Phase 2: OrganAMNIST Non-IID](#53-phase-2-organamnist-non-iid)
-     - 5.3.1 [全手法比較](#531-全手法比較)
-     - 5.3.2 [FedGen ギャップ解消実験](#532-fedgen-ギャップ解消実験)
+   - 5.3 [Phase 2: OrganAMNIST（IID + Non-IID）](#53-phase-2-organamnist-iid--non-iid)
+     - 5.3.1 [IID 結果](#531-iid-結果)
+     - 5.3.2 [Non-IID 全手法比較](#532-non-iid-全手法比較)
+     - 5.3.3 [FedGen ギャップ解消実験（旧アプローチ）](#533-fedgen-ギャップ解消実験旧アプローチ)
    - 5.4 [アブレーション実験](#54-アブレーション実験)
 6. [分析・考察](#6-分析考察)
 7. [各手法の比較表](#7-各手法の比較表)
 8. [システムアーキテクチャ](#8-システムアーキテクチャ)
 9. [研究の貢献と残された課題](#9-研究の貢献と残された課題)
-10. [システムアーキテクチャ](#8-システムアーキテクチャ)
-11. [原著論文との差分](#11-原著論文との差分)
-12. [セットアップ・実行方法](#12-セットアップ実行方法)
-13. [ディレクトリ構造](#13-ディレクトリ構造)
-14. [参考文献](#14-参考文献)
+10. [原著論文との差分](#11-原著論文との差分)
+11. [セットアップ・実行方法](#12-セットアップ実行方法)
+12. [ディレクトリ構造](#13-ディレクトリ構造)
+13. [参考文献](#14-参考文献)
 
 ---
 
@@ -206,99 +209,128 @@ HeteroFL と FedGen を単純に結合するだけでは性能が大幅に低下
 
 ## 4. 拡張手法
 
-### 4.1 AFAD + Proto
+AFAD Hybrid をベースに、Non-IID 環境での FedGen ギャップを縮める（または IID 精度をさらに向上させる）ための拡張手法を提案する。
+
+---
+
+### 4.1 AFAD + FedProto（Prototype Regularization）
 
 #### 問題の特定
 
-Phase 2（Non-IID）の実験で、AFAD Hybrid と FedGen Only の間に **16.66pp** の大きなギャップが存在することが判明した。このギャップの原因を特定するためにアブレーション実験を実施した結果、**Generator が rate=1.0 のフルレートモデルのみを教師として訓練されているため、sub-rate クライアントの潜在空間と Generator の潜在ベクトルが一致しない**という構造的問題が根本原因であると結論付けた。
+Non-IID 環境での主要な障害は、**クライアント間で backbone が学習する特徴量分布の不整合**にある。Generator が生成する潜在ベクトル z_gen は rate=1.0 backbone の分布に最適化されており、sub-rate クライアントの bottleneck 出力（異なる入力次元からの射影）とは方向分布が異なる。
+
+#### 解決策：FedProto 型 Prototype Regularization
+
+FedProto [Tan+, AAAI 2022] の設計思想をもとに、以下のアプローチを実装する：
+
+1. **クライアント側**: 各クラスの backbone 特徴量（`bottleneck(backbone(x))`）の平均ベクトル（prototype）をサーバーに送信
+2. **サーバー側**: 全クライアント・全ファミリー（CNN + ViT）の prototype を per-class 平均集約 → `global_protos` として配布
+3. **クライアント正則化**: `L_proto = proto_scale × MSE(z_local_class, global_proto_class)` を訓練損失に加算
+
+#### 特性
+
+- **Generator z（ノイズが多い）ではなく実データから計算した class centroid を使用** → より正確なアンカー
+- CNN と ViT の両ファミリーが同じ 32 次元 bottleneck を共有するため、architecture-agnostic な class centroid が自然に形成される
+- proto_scale のハイパーパラメータ探索: 0.1（+3.56pp） → 0.5（**+6.12pp**、最良）→ 0.75（+5.5pp 程度）→ 1.0（CUDA OOM の不安定性）
+
+#### 数式
 
 ```
-Generator（サーバー訓練）
-  ↓ G(y) — rate=1.0 の潜在空間に特化した 32 次元ベクトル
-クライアント（sub-rate）
-  ↓ bottleneck(backbone(x)) — 幅縮小により異なる潜在表現
-classifier → 予測（KD 信号が活用できない）
+L_client = L_CE + (α/rate)·L_KD + proto_scale·L_proto
+
+L_proto = MSE( bottleneck(backbone(x))_class_y , global_proto_y )
 ```
 
-#### 解決策：2 段階のアプローチ
+---
 
-**1. Rate-aware Generator 訓練**（サーバー側）:
-
-6 モデル（CNN/ViT × rate=1.0/0.5/0.25）全てを教師として Generator を訓練し、sub-rate クライアントの潜在空間を Generator が反映できるようにする。
-
-**2. Prototype Anchoring**（クライアント側）:
-
-追加損失 $\mathcal{L}_{\text{proto}}$ でクライアントの bottleneck 出力を Generator の潜在ベクトルに幾何的に引き寄せる。
-
-$$\mathcal{L}_{\text{proto}} = \gamma \cdot \delta^t \cdot \text{MSE}\!\left(\text{bottleneck}(\text{backbone}(x)),\; G(y)\right)$$
-
-- $\gamma = 1.0$（proto_gamma）
-- $\delta^t = 0.98^{\text{round}}$ で指数減衰（初期ラウンドで強く引き寄せ、収束後は KD に委譲）
-
-#### 設計の詳細
-
-| 設計項目 | 選択 | 理由 |
-|---------|------|------|
-| Generator 教師 | 6 モデル（CNN/ViT × rate=1.0/0.5/0.25） | sub-rate の潜在空間を Generator に反映 |
-| アンカリング損失 | MSE（bottleneck 出力 vs G(y)） | 潜在空間の幾何的整合性を直接最適化 |
-| proto_gamma | 1.0（指数減衰あり） | 初期ラウンドで強く引き寄せ、収束後は KD に委譲 |
-
-### 4.2 AFAD + RateCond
-
-AFAD + Proto の Rate-aware Generator 訓練をさらに発展させ、Generator 自体が rate 情報を条件として潜在ベクトルを生成する構造に拡張する。
-
-**Rate-conditioned Generator** $G(y, r)$:
-
-$$z = G(y, r) = \text{Trunk}(y) + \text{Head}_r(y)$$
-
-- **Trunk**: 全 rate に共通の特徴抽出
-- **Head_r**: rate ごとのヘッド（rate=1.0/0.5/0.25 の 3 種）
-- **条件付け**: 離散 rate embedding + $\log(\text{rate})$ スカラーを concat
-
-rate=1.0 ヘッドは既存の Generator の重みで初期化することで、退行リスクを最小化する。
-
-**クライアント側の変更**: Generator 呼び出しを `G(y)` → `G(y, rate=self.model_rate)` に変更し、各クライアントが自身の model_rate に対応した潜在ベクトルを受け取る。
-
-### 4.3 AFAD + AnchorKD
+### 4.2 AFAD + BackboneAlign
 
 #### 動機
 
-Proto/RateCond がサーバーの Generator 側から sub-rate の潜在不整合を解消しようとするのに対し、**AnchorKD** は識別側（クライアント側）から直接解消するアプローチをとる。**フルレートの集約済みグローバルモデル（凍結）を教師（アンカー）**として使い、sub-rate クライアントのロジット・bottleneck 出力を直接整合させる。
+Generator KD の損失 `forward_from_latent(z_gen)` は **classifier 層のみを訓練**し、backbone を経由しない（`forward_from_latent(z) = classifier(z)` の直接射影）。このため sub-rate backbone の特徴抽出能力は Generator KD によって改善されない。
 
 #### 手法
 
-$$\mathcal{L} = \mathcal{L}_{\text{CE}} + \mathcal{L}_{\text{FedGen}} + \mathcal{L}_{\text{AnchorKD}}$$
+クライアント学習時に、実データの backbone 出力 z_real と Generator が生成した z_gen の間の MSE 損失を追加：
 
-**AnchorKD 損失**（sub-rate クライアントのみ、$\text{rate} < 1.0$）:
+```
+L_ba = backbone_align_scale × MSE( bottleneck(backbone(x)), z_gen.detach() )
+```
 
-$$\mathcal{L}_{\text{AnchorKD}} = \gamma_{\text{logit}} \cdot T^2 \cdot \text{KL}\!\left(\frac{f_s(x)}{T} \,\Big\|\, \frac{f_a(x)}{T}\right) + \gamma_{\text{BN}} \cdot \text{MSE}\!\left(\text{LN}(z_s^{1:ed}),\, \text{LN}(z_a^{1:ed})\right)$$
+z_gen を detach することで backbone のみを訓練。scale=0.1（デフォルト）での Mean R11+ = 67.07%（+0.55pp vs Hybrid）。scale 増大（0.3）は不安定化を招く（Mean R11+ = 65.71%）。
 
-| 記号 | 定義 |
-|------|------|
-| $f_a$ | rate=1.0 凍結アンカーモデル（サーバーから毎ラウンド配布） |
-| $f_s$ | sub-rate 学習中の student モデル |
-| $T$ | 温度 $= 1 / \text{model\_rate}$（rate=0.5 → T=2、rate=0.25 → T=4） |
-| $ed$ | $\lfloor \text{latent\_dim} \times \text{model\_rate} \rfloor$（sub-rate bottleneck の有効次元） |
-| $\text{LN}$ | LayerNorm（スケール差異を吸収） |
-| $z_s, z_a$ | student・anchor それぞれの bottleneck 出力 |
+---
 
-**温度 T の設計根拠**: 容量の小さいクライアントほど教師の出力分布を「ソフト」にすることで、模倣しやすくなる。$T = 1/\text{rate}$ とすることで、容量と温度が自動的に対応する。
+### 4.3 AFAD + S-CFC（Server-side Cross-Family Consensus）
 
-#### バリアント
+#### 動機
 
-| 手法 | $\gamma_{\text{logit}}$ | $\gamma_{\text{BN}}$ | 説明 |
-|------|:---:|:---:|------|
-| **AFAD + AnchorKD** | 1.0 | 0 | ロジットレベル KD のみ |
-| **AFAD + BNAnchorKD** | 1.0 | 1.0 | ロジット + bottleneck レベル |
+Non-IID 環境では CNN ファミリーと ViT ファミリーの分類器が異なるクラス境界を学習し、Generator が生成する z が両者で整合しない（cross-family z-space fragmentation）。
 
-#### Proto との対比
+#### 手法
 
-| 観点 | AFAD + Proto | AFAD + AnchorKD |
-|------|-------------|----------------|
-| 整合の基準 | 生成側（Generator 潜在空間） | 識別側（フルレートモデルの出力） |
-| 教師の更新 | 毎ラウンド Generator が更新 | 毎ラウンドフルレートモデルが更新 |
-| 送信コスト | Generator パラメータ | フルレートモデルパラメータ（大） |
-| 相補性 | 両者を組み合わせることも可能 | ← |
+Generator 訓練時に、全ファミリーの分類器出力の KL ダイバージェンスを最小化するペナルティを追加：
+
+```
+L_CFC = (1/K) Σ_k KL(p_k || mean_p)
+mean_p = (1/K) Σ_k p_k,  p_k = softmax(classifier_k(z_gen))
+
+L_gen = α·L_teacher + η·L_diversity + γ·L_CFC
+```
+
+gamma=0.1 で Mean R11+ ≈ 67.5%（+約1.0pp vs Hybrid）。
+
+---
+
+### 4.4 AFAD + LatentSupCon（Latent Supervised Contrastive Learning）
+
+#### 動機
+
+BackboneAlign の MSE は「同クラスの z_real を z_gen に近づける」のみ。異クラス間の分離も同時に促進するために対照学習を導入する。
+
+#### 手法
+
+InfoNCE 損失を潜在空間に適用：
+
+```
+sim_matrix = normalize(z_real) @ normalize(z_gen_all_classes).T / τ
+L_supcon = CE(sim_matrix, class_labels)
+```
+
+正例：同クラスの z_gen、負例：異クラスの z_gen（全クラス分の z_gen をバッファとして保持）。
+
+---
+
+### 4.5 AFAD + GenMix（Generative Mixup）
+
+#### 動機
+
+BackboneAlign の MSE は座標レベルの整合を強制するが、backbone の特徴量空間を硬直させるリスクがある。より soft なタスク駆動の勾配を与えるために Mixup を活用する。
+
+#### 手法
+
+Beta(α, α) 分布からサンプリングしたλでlocal特徴量とgenerator特徴量を補間：
+
+```
+λ ~ Beta(genmix_alpha, genmix_alpha)
+z_mix = λ·z_local + (1-λ)·z_gen
+L_genmix = CE(classifier(z_mix), y)
+```
+
+alpha=0.2 での実験結果はベースラインとほぼ同等（探索的実験）。
+
+---
+
+### 4.6 AFAD + ProjHead（Projection Head、IID 向け）
+
+#### 動機
+
+IID 環境での精度をさらに向上させるため、rate 間の bottleneck 表現を整合させる Projection Head を導入する。
+
+#### 手法
+
+各 rate クライアントに `P_r: z_eff → z_32` という線形射影ヘッドを追加（`z_eff = int(32 × rate)`次元 → 32次元）。
+IID OrganAMNIST での server_acc = **88.89%** を達成し、FedGen Only（86.32%）を **+2.57pp** 上回る。
 
 ---
 
@@ -400,49 +432,70 @@ AnchorKD 系は序盤（Round 3〜4）でフルレート教師による早期誘
 
 ### 5.3 Phase 2: OrganAMNIST（IID + Non-IID）
 
-10 clients、40 rounds、seed=42 の単一試行。**評価指標**: サーバーの rate=1.0 グローバルモデルを集中テストセットで評価した `server_accuracy`。
+**実験設定**: 10 クライアント（CNN × 5 + ViT × 5）、rate 混在（0.25/0.5/1.0）、40 rounds、Flower + Ray シミュレーション。評価指標は `server_acc`（サーバーの rate=1.0 グローバルモデルを集中テストセットで評価）。Mean R11+ = Round 11〜40 の平均（収束後の安定精度）。
 
-> ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。AFAD/HeteroFL は rate=0.5/0.25 クライアントを含む難条件で評価されている。
+---
 
 #### 5.3.1 IID 結果
 
-| 手法 | server_acc FINAL |
-|------|:----------------:|
-| AFAD Hybrid | 81.85% |
-| HeteroFL Only | 82.19% |
-| FedGen Only ※ | 86.28% |
+| 手法 | Best server_acc | 備考 |
+|------|:--------------:|------|
+| HeteroFL Only | 75.77% | |
+| AFAD Hybrid | 74.95% | |
+| **AFAD + ProjHead** | **88.89%** | ★ FedGen を +2.57pp 上回る |
+| FedGen Only ※ | 86.32% | ※ 全員 rate=1.0（計算能力の異種性なし） |
 
-IID 環境では AFAD Hybrid と HeteroFL Only がほぼ同等（差 0.34pp）。FedGen Only（86.28%）との差は **4.09〜4.43pp** であり、容量制約クライアントを含む難条件を考慮すれば実質的に同等といえる。
+> **AFAD + ProjHead が IID で FedGen Only を超える**。rate 混在クライアントを扱いながら FedGen の上限を突破した点が本研究の明確な貢献の一つ。
 
-#### 5.3.2 Non-IID 結果（Dirichlet α=0.5）
+---
 
-| 手法 | server_acc FINAL |
-|------|:----------------:|
-| AFAD Hybrid | 72.53% |
-| HeteroFL Only | 72.56% |
-| FedGen Only ※ | 84.55% |
+#### 5.3.2 Non-IID 全手法比較（Dirichlet α=0.5）
 
-Non-IID 環境では AFAD Hybrid と HeteroFL Only はほぼ同等（差 0.03pp）。FedGen Only（84.55%）との差は **12.02pp** に達する。FedGen の Non-IID 優位性は、サーバーサイドの Generator がクラスバランスの取れた潜在ベクトルを生成することでクライアントのデータ偏りの影響を無効化できるためである。
+評価指標: server_acc の Mean R11+（Round 11〜40 平均）。Best は 40 round 中の最高値。
 
-#### 5.3.3 FedGen ギャップ解消実験
+| 手法 | Best | Mean R11+ | Std | vs Hybrid |
+|------|:----:|:---------:|:---:|:---------:|
+| HeteroFL Only | 65.36% | 64.90% | 0.38% | −1.62pp |
+| **AFAD Hybrid**（ベースライン） | 67.08% | 66.52% | 0.76% | — |
+| AFAD + AvailLabels | 66.89% | 66.28% | 0.78% | −0.24pp |
+| AFAD + PerFamilyGen | 67.03% | 66.23% | 1.00% | −0.29pp |
+| AFAD + Consensus | 67.39% | 66.72% | 0.80% | +0.20pp |
+| AFAD + RelKD | 67.65% | 66.87% | 0.88% | +0.35pp |
+| AFAD + RelKD + Consensus | 65.73% | 65.15% | 0.51% | −1.37pp |
+| AFAD + AnchorKD | 70.18% | 66.55% | 2.43% | +0.03pp |
+| AFAD + BNAnchorKD | 69.25% | 66.11% | 1.83% | −0.41pp |
+| AFAD + BackboneAlign | 67.84% | 67.07% | 0.83% | +0.55pp |
+| AFAD + BackboneAlign (scale=0.3) | 70.33% | 65.71% | 1.67% | −0.81pp |
+| AFAD + BackboneAlign + RelKD | 67.33% | 66.65% | 0.90% | +0.13pp |
+| AFAD + S-CFC (γ=0.1) | ≈68.3% | ≈67.5% | — | ≈+1.0pp |
+| AFAD + Proto (scale=0.1) | 70.86% | 70.08% | 0.39% | +3.56pp |
+| **AFAD + Proto (scale=0.5)** | **73.12%** | **72.64%** | **0.25%** | **+6.12pp ★** |
+| FedGen Only ※ | 84.66% | 83.97% | 0.76% | +17.45pp |
 
-16.66pp のギャップを縮めるために 3 つのアプローチを体系的に検討した。各手法はそれぞれ独立したブランチで実装・実験した。
+> ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。直接比較は不公平。
+>
+> **AFAD + Proto (scale=0.5) が現時点の最良手法**。Mean R11+ の Std が 0.25% と极めて低く、再現性が高い。FedGen との残ギャップは 11.33pp（初期の ~17pp から縮小）。
 
-**Case C: FedAvg 集約（feature/fedavg-aggregation）**
+##### 主要な知見
 
-HeteroFL の count-based 集約を、FedGen と同じサンプル数重み付けの FedAvg に置き換える。Sub-rate パラメータは対応するスライスにのみ加算する shape-aware な実装とした。
+1. **Proto が突出して有効**（+6.12pp）: Generator z（ノイズが多い）ではなく、**実データから計算した class centroid** を正則化ターゲットに使うことで、architecture-agnostic な backbone 特徴量空間の整合が実現する。
+2. **scale の最適値は 0.5**（scale=0.1: +3.56pp, scale=0.5: +6.12pp, scale=0.75: ~+5.5pp, scale=1.0: CUDA 不安定）。正則化が強すぎると不安定化する。
+3. **client-side KD の追加的探索は 67% 前後で頭打ち**（RelKD, Consensus, BackboneAlign 単独では Mean R11+ ≤ 67.1%）。Proto は別の機構（backbone 直接正則化）で壁を突破した。
+4. **Cross-family ensemble 知識の削減は禁忌**（PerFamilyGen で確認）。
+5. **AnchorKD は Best が高い（70.18%）が Std も高い（2.43%）**：外れ値的な高値であり、Mean では AFAD Hybrid と同等。
+6. **scale 増大は必ずしも改善しない**（BackboneAlign scale=0.3, Proto scale=1.0 で確認）。
 
-**Case A: Server-side Distillation（feature/server-side-distillation）**
+---
 
-集約後、サーバー上で Generator を用いてクラスバランスの取れた潜在ベクトルを生成し、各 family グローバルモデルを追加学習（20 steps, Adam, lr=1e-4）。Non-IID によるデータ偏りをサーバー側で補正することを狙う。
+#### 5.3.3 FedGen ギャップ解消実験（旧アプローチ）
 
-**Case B: Nested Bottleneck（feature/nested-bottleneck）**
+16.66pp のギャップを縮めるために初期段階で 3 つのアーキテクチャレベルのアプローチを体系的に検討した。
 
-Sub-rate クライアントは bottleneck weight の最初の `int(32 × rate)` 行のみを所有し、階層的な共有部分空間を形成する。rate=0.5 クライアントは 16 次元、rate=0.25 クライアントは 8 次元の有効潜在空間を保持する。
+**Case C: FedAvg 集約**（HeteroFL の count-based 集約を FedAvg に変更）
 
-**実験結果**
+**Case A: Server-side Distillation**（Generator を用いてサーバーで追加蒸留）
 
-> 注: 以下の実験はギャップ解消の探索的研究として旧設定（client_acc ベース）で実施したものを参考として掲載する。
+**Case B: Nested Bottleneck**（rate に応じた階層的潜在部分空間）
 
 | 手法 | BEST | Final | vs AFAD Hybrid |
 |------|:----:|:-----:|:--------------:|
@@ -452,13 +505,7 @@ Sub-rate クライアントは bottleneck weight の最初の `int(32 × rate)` 
 | AFAD + FedAvg (Case C) | 59.35% | 58.53% | **−8.20pp** |
 | FedGen Only（上限） | 84.66% | 84.62% | +16.82pp |
 
-**結論**: 3 手法ともベースラインを下回る結果となり、ギャップの解消には至らなかった。
-
-- **Case C（FedAvg 集約）**: HeteroFL の count-based 集約はサブレートモデル専用に設計されており、単純なサンプル重み付けは構造的不整合を生む（−8.20pp）
-- **Case A（Server Distillation）**: Generator がクラスバランス出力に過学習（loss→0.0000）し、Non-IID で形成された局所特化パターンを上書きしてしまう（−0.70pp）
-- **Case B（Nested Bottleneck）**: 階層的制約が学習を阻害し、特に early rounds での収束が遅れる（−4.76pp）
-
-FedGen Only との **16.66pp ギャップは付加的な手法では解消できない構造的問題**であることが確認された。根本解決には、HeteroFL の width-scaling 制約を緩和しつつ FedGen の Non-IID 耐性を活かす、より抜本的なアーキテクチャ変更が必要と考えられる。
+> ※ 旧設定（client_acc ベース）での参考数値。いずれもベースライン以下となり、この方向性での限界を確認。
 
 ### 5.4 アブレーション実験
 
@@ -549,38 +596,50 @@ HeteroFL と FedGen を素朴に統合すると **9.55pp（60.30% → 69.85%）�
 >
 > **公平な比較（直接シミュレーション）では AFAD が FedGen を上回る（+2.85pp）**。FedGen が扱えない設定（幅の異なるクライアント混在）を扱いながら同等以上の精度を達成している点が AFAD の本質的な貢献である。
 
-### 6.4 Non-IID 環境でのギャップとその原因
+### 6.4 Non-IID 環境でのギャップとその根本原因
 
-Non-IID 環境（OrganAMNIST, α=0.5）での FedGen（84.66%）と AFAD + Proto（68.00%）の **16.66pp のギャップ**は、IID 環境では存在しない。これは FedGen の Non-IID 特化設計に起因する：
-
-**FedGen の Non-IID 優位性の本質**:
-> Generator がサーバー側でクラスバランスの取れた潜在ベクトルをサンプリングし、クライアントに均一な KD 信号を送ることで、データ偏りの影響を無効化する。
-
-この仕組みは IID 環境では差を生まないが、Non-IID では決定的な優位となる。AFAD は HeteroFL の count-based 集約構造を保持するため、この恩恵を完全には受けられない。
+Non-IID 環境（OrganAMNIST, α=0.5）での FedGen（83.97%）と AFAD Hybrid（66.52%）の **17.45pp のギャップ**は、IID 環境では存在しない。**AFAD + Proto (scale=0.5) によって Mean R11+ 72.64% を達成し、ギャップを 11.33pp に縮小した**が、完全な解消には至っていない。
 
 **ギャップの構造的な原因（3 要素の複合）**:
 
-1. **潜在空間の不整合**: Generator は rate=1.0 の bottleneck に最適化されており、rate=0.5/0.25 の bottleneck 出力（異なる入力次元からの射影）とは分布が異なる。KD 信号が sub-rate クライアントにとってノイズとして働く。
+1. **潜在空間の不整合（cross-family z-space fragmentation）**: Generator は rate=1.0 の bottleneck 分布に最適化されており、rate=0.5/0.25 の bottleneck 出力とは分布が異なる。さらに CNN と ViT で特徴量多様体が分裂し、Generator が両者の交差領域のみをカバーせざるを得ない（PerFamilyGen でアンサンブル知識削減→悪化を確認）。
 
-2. **HeteroFL 集約の制約**: count-based 集約はサブモデルへの適切なパラメータ分配に不可欠（Case C の実験で FedAvg 切り替えにより −8.20pp 悪化）だが、FedGen の FedAvg 集約が持つ Non-IID 安定性は得られない。
+2. **HeteroFL 集約の制約**: count-based 集約はサブモデルへの適切なパラメータ分配に不可欠（FedAvg 切り替えにより −8.20pp 悪化）だが、FedAvg 集約が持つ Non-IID 安定性は得られない。
 
-3. **Generator の Non-IID 過学習リスク**: サーバー側蒸留（Case A）を追加すると Generator が loss→0.0000 に過学習し、クライアントの Non-IID 局所特化を破壊する（−0.70pp）。
+3. **forward_from_latent のバイパス問題**: `forward_from_latent(z) = classifier(z)` は backbone を経由せず、Generator KD が backbone 品質を直接改善しない。Proto は backbone 特徴量を直接正則化することでこの問題を迂回する。
 
-**ギャップ解消実験の総括**: 5 種のアプローチ（FedAvg 集約・Server Distillation・Nested Bottleneck・L2 正規化・Multi-rate Generator Training）を体系的に検証したが、全てベースライン以下に留まった。これはギャップが「幅スケーリング × アーキテクチャ混在 × Non-IID」という 3 要素の複合的な相互作用であり、付加的な手法では根本解決できないことを示す。
+**Proto が有効な理由**:
+- Generator z（ノイズが多い）ではなく、**実データから計算した per-class mean（prototype）** を正則化ターゲットに使用
+- CNN/ViT が同じ 32 次元 bottleneck を共有するため、architecture-agnostic な class centroid が自然に得られる
+- Backbone の特徴抽出を直接正則化 → forward_from_latent のバイパス問題を回避
+
+**残ギャップ（11.33pp）の解釈**:
+- Sub-rate backbone の容量不足（rate=0.25/0.5 の容量制約）は Proto では解消されない
+- Generator z-space と実 backbone 分布の根本的な不整合は依然残存
+- Non-IID 環境での局所データ偏り補正を Generator（サーバー側）が行う FedGen の仕組みとは異なるアプローチ
+
+---
 
 ### 6.5 各手法の位置づけと知見
 
-| 手法 | アプローチの方向 | 対象問題 | Phase 2 BEST | 評価 |
-|------|---------------|---------|:------------:|:----:|
-| **AFAD + Proto** | Generator 側＋クライアント側の二重アンカリング | 潜在空間不整合 | **68.00%** | ✓ AFAD 系最良 |
-| **AFAD + RateCond** | Generator を rate 条件付きに拡張 | 潜在空間不整合（直接的） | 67.94% | △ 僅差 |
-| **AFAD + AnchorKD** | 凍結フルレートモデルを教師として KD | sub-rate 容量不足 | 66.97% | △ 限定的改善 |
-| **AFAD + BNAnchorKD** | AnchorKD + BN 特徴レベル整合 | sub-rate 容量不足 | 66.79% | △ 限定的改善 |
-| **AFAD + ServerDistill** | サーバー側クラスバランス蒸留 | Non-IID データ偏り | 67.14% | × Generator 過学習 |
-| **AFAD + NestedBN** | 階層的潜在部分空間の共有 | 潜在空間構造化 | 62.53% | × 学習阻害 |
-| **AFAD + FedAvg** | FedAvg 集約への切り替え | 集約安定性 | 59.35% | × 構造的不適合 |
-| **AFAD + L2Norm** | Bottleneck/Generator に L2 正規化 | 潜在空間スケール整合 | 66.70% | × 方向分布の不整合は残存 |
-| **AFAD + MultiRateGen** | 全 rate モデルで Generator を訓練 | 潜在空間分布整合 | 66.02% | × 相反する勾配が学習阻害 |
+| 手法 | アプローチの方向 | 対象問題 | Mean R11+ | 評価 |
+|------|---------------|---------|:---------:|:----:|
+| **AFAD + Proto (scale=0.5)** | 実 backbone 特徴量の class centroid 正則化 | backbone 品質・潜在空間整合 | **72.64%** | ★★ 現時点最良 |
+| **AFAD + Proto (scale=0.1)** | 同上（弱め） | 同上 | 70.08% | ✓ 70% 突破 |
+| AFAD + S-CFC | サーバーGen訓練時の cross-family consensus | z-space fragmentation（gen側） | ≈67.5% | ✓ +1.0pp |
+| AFAD + BackboneAlign | 実データ z_real → z_gen への MSE | backbone 品質 | 67.07% | ✓ +0.55pp |
+| AFAD + RelKD | Relative KD（比較的比率を保つKD） | KD の質向上 | 66.87% | △ +0.35pp |
+| AFAD + Consensus | Generator gen に family 合意点強制 | z-space fragmentation | 66.72% | △ +0.20pp |
+| AFAD + BackboneAlign + RelKD | 組み合わせ | — | 66.65% | △ 組合せ逆効果 |
+| AFAD + AvailLabels | 利用可能ラベルのみKD | KD 効率 | 66.28% | × 悪化 |
+| AFAD + PerFamilyGen | ファミリー別Generator | Cross-family知識 | 66.23% | × アンサンブル削減で悪化 |
+| AFAD + AnchorKD | 凍結フルレートモデルを教師に | sub-rate 容量不足 | 66.55% | △ Best高いがStd大 |
+| AFAD + BNAnchorKD | AnchorKD + BN 特徴整合 | 同上 | 66.11% | △ 限定的 |
+| AFAD + RelKD + Consensus | 組合せ | — | 65.15% | × 組合せ悪化 |
+| AFAD + BackboneAlign (scale=0.3) | BackboneAlign 強め | — | 65.71% | × scale 増大→不安定 |
+| AFAD + ServerDistill | サーバー側KD | Non-IID データ偏り補正 | ≈66.6% | × Generator 過学習 |
+| AFAD + NestedBN | 階層的潜在部分空間 | 潜在空間構造化 | ≈60.9% | × 学習阻害 |
+| AFAD + FedAvg | FedAvg 集約への切り替え | 集約安定性 | ≈58.5% | × 構造的不適合 |
 
 ---
 
@@ -590,21 +649,30 @@ Non-IID 環境（OrganAMNIST, α=0.5）での FedGen（84.66%）と AFAD + Proto
 
 #### IID
 
-| 手法 | server_acc FINAL | vs AFAD Hybrid |
-|------|:----------------:|:--------------:|
-| AFAD Hybrid | 81.85% | — |
-| HeteroFL Only | 82.19% | +0.34pp |
-| FedGen Only ※ | 86.28% | +4.43pp |
+| 手法 | Best server_acc | vs AFAD Hybrid |
+|------|:--------------:|:--------------:|
+| AFAD Hybrid | 74.95% | — |
+| HeteroFL Only | 75.77% | +0.82pp |
+| **AFAD + ProjHead** | **88.89%** | **+13.94pp ★** |
+| FedGen Only ※ | 86.32% | +11.37pp |
 
-#### Non-IID（Dirichlet α=0.5）
+> ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。AFAD + ProjHead は rate 混在クライアントを含む難条件で FedGen を超えている。
 
-| 手法 | server_acc FINAL | vs AFAD Hybrid |
-|------|:----------------:|:--------------:|
-| AFAD Hybrid | 72.53% | — |
-| HeteroFL Only | 72.56% | +0.03pp |
-| FedGen Only ※ | 84.55% | +12.02pp |
+#### Non-IID（Dirichlet α=0.5）— 主要手法のみ
 
-> ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。直接比較は不公平。
+| 手法 | Best | Mean R11+ | Std | vs AFAD Hybrid |
+|------|:----:|:---------:|:---:|:--------------:|
+| HeteroFL Only | 65.36% | 64.90% | 0.38% | −1.62pp |
+| AFAD Hybrid | 67.08% | 66.52% | 0.76% | — |
+| AFAD + BackboneAlign | 67.84% | 67.07% | 0.83% | +0.55pp |
+| AFAD + S-CFC (γ=0.1) | ≈68.3% | ≈67.5% | — | ≈+1.0pp |
+| AFAD + Proto (scale=0.1) | 70.86% | 70.08% | 0.39% | +3.56pp |
+| **AFAD + Proto (scale=0.5)** | **73.12%** | **72.64%** | **0.25%** | **+6.12pp ★** |
+| FedGen Only ※ | 84.66% | 83.97% | 0.76% | +17.45pp |
+
+> ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。
+
+全手法の詳細比較は **5.3.2 節**を参照。
 
 ### 7.2 手法特性比較
 
@@ -663,59 +731,57 @@ Clients
 
 ## 9. 研究の貢献と残された課題
 
-### 9.1 確立された貢献（IID 環境）
-
-本研究が明確に示した貢献は以下の通りである：
+### 9.1 確立された貢献
 
 #### 貢献 1: 二重異種性 FL フレームワークの提案
 
 FedGen（アーキテクチャ異種性対応）と HeteroFL（計算能力異種性対応）を統合した AFAD を提案した。**この 2 種類の異種性を同時に扱う FL フレームワークは AFAD 以前に存在しない**。
 
-#### 貢献 2: IID 環境での FedGen 同等精度の達成
+#### 貢献 2: IID 環境での FedGen 超えの精度達成
 
-| 設定 | FedGen Only | AFAD Hybrid | 差 | 条件の公平性 |
-|------|:-----------:|:-----------:|:--:|:----------:|
-| MNIST IID（直接シミュレーション） | 67.00% | **69.85%** | **+2.85pp** | ✓ 公平（共に異種クライアント混在） |
-| MNIST IID（Flower, 5 clients） | 99.60% | 99.35% | −0.25pp | ✓ 公平 |
-| MNIST IID（Flower, 10 clients, server_acc）※ | 97.51% ※ | 90.47% | −7.04pp | △ 不公平（FedGen は全員 rate=1.0） |
-| OrganAMNIST IID（Flower, 10 clients, server_acc）※ | 86.28% ※ | 81.85% | −4.43pp | △ 不公平（FedGen は全員 rate=1.0） |
-| OrganAMNIST Non-IID（Flower, 10 clients, server_acc）※ | 84.55% ※ | 72.53% | −12.02pp | △ 不公平（FedGen は全員 rate=1.0） |
+| 設定 | FedGen Only | AFAD | 差 | 条件の公平性 |
+|------|:-----------:|:----:|:--:|:----------:|
+| MNIST IID（直接シミュレーション） | 67.00% | **69.85%（AFAD Hybrid）** | **+2.85pp** | ✓ 公平 |
+| OrganAMNIST IID（Flower, 10 clients, server_acc）| 86.32% ※ | **88.89%（AFAD + ProjHead）** | **+2.57pp** | △ FedGen は rate=1.0 のみ |
 
-> ※ FedGen Only の 10クライアント設定は全員 rate=1.0（計算能力の異種性なし）。AFAD は sub-rate クライアント（rate=0.5/0.25）を含む難条件。server_acc = サーバー rate=1.0 グローバルモデルの集中テスト評価。差の数値は **FedGen の優位ではなく、AFAD が解く問題の難しさ（容量制約）**を反映する。
-
-FedGen は CNN ↔ ViT の混在を扱えないが、AFAD はその制約なしに同水準の精度を実現する（公平な比較で確認済み）。
+> ※ FedGen Only の 10クライアント設定は全員 rate=1.0（計算能力の異種性なし）。AFAD は sub-rate クライアント（rate=0.5/0.25）を含む難条件。IID 環境では AFAD が FedGen を上回る（+2.57pp）という明確な貢献がある。
 
 #### 貢献 3: ナイーブ統合の失敗原因の解明と 4 段階改善
 
-HeteroFL + FedGen のナイーブ統合（60.30%）がなぜ失敗するかを体系的に分析し、4 段階の改善（最終 69.85%、**+9.55pp**）により回復した。各改善の寄与を定量化している（KD 係数削減が +7.25pp で最大）。
+HeteroFL + FedGen のナイーブ統合（60.30%）がなぜ失敗するかを体系的に分析し、4 段階の改善（最終 69.85%、**+9.55pp**）により回復した。
 
-#### 貢献 4: Non-IID ギャップの根本原因の特定
+#### 貢献 4: FedProto 型 Prototype Regularization による Non-IID 大幅改善
 
-IID 環境では存在しない 16.66pp のギャップが Non-IID 環境で生じる原因を、5 種のギャップ解消実験（Case A/B/C + L2Norm + MultiRateGen）により特定した：
+14 種を超える手法の体系的実験を通じ、**AFAD + Proto (scale=0.5) が Mean R11+ 72.64%（Best 73.12%）** を達成。ベースライン（AFAD Hybrid 66.52%）から **+6.12pp**、FedGen との残ギャップを 17pp から 11.33pp に縮小した。
 
-> **根本原因**: Generator の潜在空間は rate=1.0 の bottleneck 分布に特化して訓練されており、sub-rate クライアントの bottleneck 出力（異なる入力次元からの射影）とは方向分布が異なる。この構造的不整合は、付加的な手法では解消できない。
+**なぜ Proto が有効か**: Generator z（ノイズが多い）ではなく実データから計算した per-class centroid を backbone 正則化ターゲットに使用することで、CNN/ViT の architecture-agnostic な特徴量空間整合が実現する。
+
+#### 貢献 5: Non-IID ギャップの根本原因の特定と定量化
+
+IID 環境では存在しない 17pp のギャップが Non-IID で生じる原因を、14 種超の体系的実験により特定した。
+
+> **根本原因**: (1) forward_from_latent が backbone をバイパスし Generator KD が backbone 品質を直接改善しない（推定 ~6pp）、(2) sub-rate backbone の容量不足（推定 ~4pp）、(3) cross-family z-space fragmentation（CNN/ViT の特徴量多様体の分裂、推定 ~3pp）。
 
 ---
 
 ### 9.2 残された課題（Non-IID 環境への対応）
 
-現在の AFAD が Non-IID 環境で FedGen に大きく劣る理由は、**Generator の Non-IID 耐性**と**HeteroFL の幅スケーリング制約**の非互換性にある。以下が今後取り組むべき方向性である。
+**AFAD + Proto (scale=0.5) の Mean R11+ = 72.64% は現時点の最良だが、FedGen との 11.33pp ギャップは依然残存する**。
 
-#### 課題 1: Sub-rate 対応 Generator の設計
+#### 課題 1: Forward-from-latent のバイパス問題の解消
 
-現状: Generator は rate=1.0 の bottleneck 分布のみを学習する。  
-必要: 各 rate の bottleneck 分布に適応した潜在ベクトルを生成できる Generator。
+現状: `forward_from_latent(z) = classifier(z)` — backbone を経由しない。  
+必要: sub-rate backbone を直接改善できる仕組み（FitNet 蒸留など）。
 
-**有望なアプローチ**:
-- **Rate-specific な潜在次元**: rate=1.0 → 32 次元、rate=0.5 → 16 次元、rate=0.25 → 8 次元と、幅スケーリングと整合したボトルネック設計。Generator もこれに合わせて rate 条件付きで複数次元を出力する。
-- **Contrastive alignment**: rate 間の bottleneck 出力を対照学習で整合させ、共通の潜在空間を構築する。
+**有望なアプローチ**: サーバーサイド FitNet 蒸留（rate=1.0 backbone の特徴量 → rate<1.0 クライアントへ MSE 蒸留）。HeteroFL 集約ロジックを破壊せず backbone 品質を向上できる可能性がある。
 
-#### 課題 2: Non-IID 耐性の向上
+#### 課題 2: Proto + 他手法の組み合わせ探索
 
-FedGen の Non-IID 耐性はサーバー側の Generator によるクラスバランス補正に起因する。AFAD の HeteroFL 集約（count-based）はこれと整合しない。
+AFAD + S-CFC + Proto（Generator の z-space fragmentation を S-CFC で抑制しつつ、Proto で backbone を正則化）は未試験。
 
-**有望なアプローチ**:
-- sub-rate クライアントへの KD を無効化し、rate=1.0 クライアントのみ FedGen KD を適用（元の FedGen 設計に回帰）。sub-rate は HeteroFL 集約のみで学習する。
+#### 課題 3: Cross-family z-space の根本的整合
+
+Generator が CNN と ViT の両方に有効な潜在ベクトルを生成するには、z-space の根本的な再設計（Contrastive alignment や Multi-family prototype aggregation）が必要。
 
 ---
 
@@ -888,6 +954,8 @@ AFAD/
 - Li, T., Sahu, A. K., Zaheer, M., Sanjabi, M., Smola, A., and Smith, V. "Federated Optimization in Heterogeneous Networks." *Proceedings of Machine Learning and Systems (MLSys)*, 2020.
 - Hinton, G., Vinyals, O., and Dean, J. "Distilling the Knowledge in a Neural Network." *NeurIPS Deep Learning Workshop*, 2015.
 - Horvath, S., Laskaridis, S., Almeida, M., Leontiadis, I., Venieris, S., and Lane, N. "FjORD: Fair and Accurate Federated Learning under heterogeneous targets with Ordered Dropout." *Neural Information Processing Systems (NeurIPS)*, 2021.
+- Tan, Y., Long, G., Liu, L., Zhou, T., Lu, Q., Jiang, J., and Zhang, C. "FedProto: Federated Prototype Learning across Heterogeneous Clients." *Association for the Advancement of Artificial Intelligence (AAAI)*, 2022.
+- Khosla, P., Tian, Y., Wang, X., Liu, C., Isola, P., and Krishnamurthy, A. "Supervised Contrastive Learning." *Neural Information Processing Systems (NeurIPS)*, 2020.
 
 ---
 

@@ -177,6 +177,10 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         self._consensus_labels: np.ndarray | None = None
         self._use_consensus = use_consensus
 
+        # FedProto: per-class backbone feature centroids aggregated from all clients.
+        # dict[int, np.ndarray] — class_id -> 32-dim centroid; updated each round.
+        self._global_protos: dict[int, np.ndarray] | None = None
+
         # For Flower's return value (keep one set of params)
         self._global_params_for_flower: list[np.ndarray] | None = None
 
@@ -395,6 +399,42 @@ class AFADStrategy(fl.server.strategy.FedAvg):
 
         return consensus
 
+    def _aggregate_protos(
+        self,
+        results: list[tuple[ClientProxy, FitRes]],
+    ) -> dict[int, np.ndarray] | None:
+        """Aggregate per-class backbone feature centroids from client metrics.
+
+        Computes weighted mean of local prototypes across all clients (both
+        CNN and ViT families), producing architecture-agnostic class centroids
+        in the shared 32-dim bottleneck space.
+
+        Returns None if no clients reported prototypes (proto_scale=0).
+        """
+        proto_sums: dict[int, np.ndarray] = {}
+        proto_counts: dict[int, int] = {}
+
+        for _, fit_res in results:
+            proto_bytes = fit_res.metrics.get("local_protos", None)
+            if not isinstance(proto_bytes, bytes):
+                continue
+            local_protos: dict[int, np.ndarray] = pickle.loads(proto_bytes)  # noqa: S301
+            for cls, proto in local_protos.items():
+                if cls not in proto_sums:
+                    proto_sums[cls] = np.zeros_like(proto, dtype=np.float32)
+                    proto_counts[cls] = 0
+                proto_sums[cls] += proto
+                proto_counts[cls] += 1
+
+        if not proto_sums:
+            return self._global_protos  # preserve previous round's protos
+
+        return {
+            cls: proto_sums[cls] / proto_counts[cls]
+            for cls in proto_sums
+            if proto_counts[cls] > 0
+        }
+
     # ─── Flower overrides ─────────────────────────────────────────
 
     def initialize_parameters(
@@ -495,6 +535,10 @@ class AFADStrategy(fl.server.strategy.FedAvg):
             if consensus_bytes is not None:
                 new_config["consensus_labels"] = consensus_bytes
 
+            # Send global prototypes if available (FedProto regularization)
+            if self._global_protos is not None:
+                new_config["global_protos"] = pickle.dumps(self._global_protos)
+
             # Determine model parameters to send
             if self.enable_heterofl and family and family in self.family_global_models:
                 # HeteroFL mode: distribute sub-model from family global
@@ -573,6 +617,9 @@ class AFADStrategy(fl.server.strategy.FedAvg):
         # Recompute cross-family consensus labels after generator training
         if self._use_consensus and self._generator_trained:
             self._consensus_labels = self._compute_consensus_labels()
+
+        # Aggregate FedProto prototypes from clients
+        self._global_protos = self._aggregate_protos(results)
 
         # Metrics
         metrics: dict[str, Scalar] = {

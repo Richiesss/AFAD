@@ -257,6 +257,7 @@ def afad_client_fn_builder(
     supcon_scale: float = 0.0,
     supcon_tau: float = 0.1,
     genmix_alpha: float = 0.0,
+    proto_scale: float = 0.0,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -309,6 +310,7 @@ def afad_client_fn_builder(
             supcon_scale=supcon_scale,
             supcon_tau=supcon_tau,
             genmix_alpha=genmix_alpha,
+            proto_scale=proto_scale,
         ).to_client()
 
     return client_fn
@@ -532,6 +534,7 @@ def run_single_experiment(
     supcon_scale: float = 0.0,
     supcon_tau: float = 0.1,
     genmix_alpha: float = 0.0,
+    proto_scale: float = 0.0,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -597,6 +600,7 @@ def run_single_experiment(
             supcon_scale=supcon_scale,
             supcon_tau=supcon_tau,
             genmix_alpha=genmix_alpha,
+            proto_scale=proto_scale,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -892,6 +896,28 @@ def main():
         "AFAD + BackboneAlign + RelKD": {
             "enable_fedgen": True, "enable_heterofl": True,
             "use_adapters": False, "backbone_align_scale": 0.1, "relkd_scale": 1.0,
+        },
+        # FedProto-style prototype regularization: server aggregates per-class
+        # backbone feature centroids from all client families (CNN+ViT) and
+        # distributes them as global prototypes. Clients are regularized to
+        # produce features close to these architecture-agnostic centroids.
+        # Unlike BackboneAlign (generator z as teacher), prototypes are derived
+        # from real backbone features — data-driven and family-agnostic.
+        "AFAD + Proto": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "proto_scale": 0.1,
+        },
+        "AFAD + Proto (scale=0.5)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "proto_scale": 0.5,
+        },
+        "AFAD + Proto (scale=0.75)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "proto_scale": 0.75,
+        },
+        "AFAD + Proto (scale=1.0)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "proto_scale": 1.0,
         },
         # GenMix: task-driven generative feature mixup.
         # z_mix = λ*z_local + (1-λ)*z_gen (λ~Beta(α,α)), CE(classifier(z_mix), y).

@@ -97,6 +97,14 @@ class AFADClient(fl.client.NumPyClient):
             Task-driven generative feature mixup: z_mix = λ*z_local + (1-λ)*z_gen,
             then CE(classifier(z_mix), y). Backbone learns via soft task gradients
             rather than hard MSE coordinate matching, adapting to sub-rate capacity.
+        proto_scale: Weight for FedProto-style prototype regularization (0.0 = disabled).
+            Server aggregates per-class backbone feature centroids from all clients
+            (both CNN and ViT families) and distributes them as global prototypes.
+            Clients are regularized to produce features close to these centroids:
+            MSE(bottleneck(backbone(x_i)), global_proto[y_i]).
+            Unlike BackboneAlign (generator z as teacher), prototypes are derived
+            from real backbone features across all client families, giving a
+            data-driven, architecture-agnostic alignment target.
     """
 
     def __init__(
@@ -126,6 +134,7 @@ class AFADClient(fl.client.NumPyClient):
         supcon_scale: float = 0.0,
         supcon_tau: float = 0.1,
         genmix_alpha: float = 0.0,
+        proto_scale: float = 0.0,
     ):
         self.cid = cid
         self.model = model
@@ -158,6 +167,10 @@ class AFADClient(fl.client.NumPyClient):
         self.supcon_scale = supcon_scale
         self.supcon_tau = supcon_tau
         self.genmix_alpha = genmix_alpha
+        self.proto_scale = proto_scale
+        # Global prototypes: populated each round from server config["global_protos"]
+        # dict[int, np.ndarray] — class_id -> 32-dim centroid
+        self.global_protos: dict[int, np.ndarray] | None = None
 
         # Precompute label counts and available labels
         self.label_counts = self._compute_label_counts()
@@ -168,6 +181,37 @@ class AFADClient(fl.client.NumPyClient):
             f"Client {cid} initialized: model={model_name}, device={self.device}, "
             f"family={family}, model_rate={model_rate}"
         )
+
+    def _compute_local_protos(self) -> dict[int, np.ndarray]:
+        """Compute per-class backbone feature centroids from local training data.
+
+        Returns dict mapping class_id -> mean bottleneck(backbone(x)) over local samples.
+        Only includes classes present in local data (available_labels).
+        Used for FedProto-style prototype aggregation on the server.
+        """
+        proto_sums: dict[int, np.ndarray] = {}
+        proto_counts: dict[int, int] = {}
+
+        self.model.eval()
+        with torch.no_grad():
+            for images, labels in self.train_loader:
+                images = images.to(self.device)
+                z = self.model.bottleneck(
+                    self.model.backbone(images)
+                ).cpu().numpy()  # [B, 32]
+                for i, label in enumerate(labels.tolist()):
+                    if label not in proto_sums:
+                        proto_sums[label] = np.zeros(z.shape[1], dtype=np.float32)
+                        proto_counts[label] = 0
+                    proto_sums[label] += z[i]
+                    proto_counts[label] += 1
+        self.model.train()
+
+        return {
+            y: proto_sums[y] / proto_counts[y]
+            for y in proto_sums
+            if proto_counts[y] > 0
+        }
 
     def _compute_label_counts(self) -> list[int]:
         """Count per-class samples in training data (computed once)."""
@@ -281,6 +325,11 @@ class AFADClient(fl.client.NumPyClient):
         if isinstance(consensus_bytes, bytes):
             self.consensus_labels = pickle.loads(consensus_bytes)  # noqa: S301
 
+        # Update global prototypes if provided
+        proto_bytes = config.get("global_protos", None)
+        if isinstance(proto_bytes, bytes):
+            self.global_protos = pickle.loads(proto_bytes)  # noqa: S301
+
         glob_iter = config.get("round", 0)
         regularization = config.get("regularization", glob_iter > 0)
 
@@ -301,16 +350,24 @@ class AFADClient(fl.client.NumPyClient):
         # Serialize label_counts as comma-separated string for Flower Scalar
         label_counts_str = ",".join(str(c) for c in self.label_counts)
 
+        metrics: dict = {
+            "family": self.family,
+            "model_rate": self.model_rate,
+            "client_id": self.cid,
+            "model_name": self.model_name,
+            "label_counts": label_counts_str,
+        }
+
+        # Compute and return local prototypes for server aggregation
+        if self.proto_scale > 0:
+            local_protos = self._compute_local_protos()
+            if local_protos:
+                metrics["local_protos"] = pickle.dumps(local_protos)
+
         return (
             self.get_parameters(config={}),
             len(self.train_loader.dataset),
-            {
-                "family": self.family,
-                "model_rate": self.model_rate,
-                "client_id": self.cid,
-                "model_name": self.model_name,
-                "label_counts": label_counts_str,
-            },
+            metrics,
         )
 
     def _train(
@@ -511,6 +568,32 @@ class AFADClient(fl.client.NumPyClient):
                             sim_matrix, labels
                         )
                         loss = loss + supcon_loss
+
+                    # FedProto regularization: attract backbone features toward
+                    # server-aggregated per-class centroids from all client families.
+                    # Unlike BackboneAlign (generator z as teacher), prototypes are
+                    # derived from real backbone features across CNN+ViT families,
+                    # providing a data-driven architecture-agnostic alignment target.
+                    if self.proto_scale > 0 and self.global_protos is not None:
+                        z_local_p = self.model.bottleneck(self.model.backbone(images))
+                        proto_targets = torch.stack([
+                            torch.tensor(
+                                self.global_protos[y.item()],
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            for y in labels
+                            if y.item() in self.global_protos
+                        ])
+                        valid_mask = torch.tensor(
+                            [y.item() in self.global_protos for y in labels],
+                            device=self.device,
+                        )
+                        if valid_mask.any():
+                            proto_loss = self.proto_scale * F.mse_loss(
+                                z_local_p[valid_mask], proto_targets
+                            )
+                            loss = loss + proto_loss
 
                     # Cross-family Consensus: align generated logits to server-side
                     # per-class soft labels averaged from CNN + ViT classifiers.
