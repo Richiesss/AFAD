@@ -231,7 +231,7 @@ FedProto [Tan+, AAAI 2022] の設計思想をもとに、以下のアプロー�
 
 - **Generator z（ノイズが多い）ではなく実データから計算した class centroid を使用** → より正確なアンカー
 - CNN と ViT の両ファミリーが同じ 32 次元 bottleneck を共有するため、architecture-agnostic な class centroid が自然に形成される
-- proto_scale のハイパーパラメータ探索: 0.1（+3.56pp） → 0.5（**+6.12pp**、最良）→ 0.75（+5.5pp 程度）→ 1.0（CUDA OOM の不安定性）
+- proto_scale のハイパーパラメータ探索（Mean R11+）: 0.1（70.08%、+3.56pp） < 0.75（71.35%、+4.83pp） < **0.5（72.64%、+6.12pp ★最良）** > 1.0（CUDA 不安定）
 
 #### 数式
 
@@ -470,11 +470,12 @@ AnchorKD 系は序盤（Round 3〜4）でフルレート教師による早期誘
 | AFAD + S-CFC (γ=0.1) | ≈68.3% | ≈67.5% | — | ≈+1.0pp |
 | AFAD + Proto (scale=0.1) | 70.86% | 70.08% | 0.39% | +3.56pp |
 | **AFAD + Proto (scale=0.5)** | **73.12%** | **72.64%** | **0.25%** | **+6.12pp ★** |
+| AFAD + Proto (scale=0.75) | 71.86% | 71.35% | 0.58% | +4.83pp |
 | FedGen Only ※ | 84.66% | 83.97% | 0.76% | +17.45pp |
 
 > ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。直接比較は不公平。
 >
-> **AFAD + Proto (scale=0.5) が現時点の最良手法**。Mean R11+ の Std が 0.25% と极めて低く、再現性が高い。FedGen との残ギャップは 11.33pp（初期の ~17pp から縮小）。
+> **AFAD + Proto (scale=0.5) が最良手法**。Mean R11+ の Std が 0.25% と極めて低く、再現性が高い。scale=0.75 では過正則化により Mean R11+ が 71.35%（−1.29pp）に低下し、scale=1.0 では CUDA 不安定が発生。FedGen との残ギャップは 11.33pp（初期の ~17pp から縮小）。
 
 ##### 主要な知見
 
@@ -624,7 +625,8 @@ Non-IID 環境（OrganAMNIST, α=0.5）での FedGen（83.97%）と AFAD Hybrid�
 
 | 手法 | アプローチの方向 | 対象問題 | Mean R11+ | 評価 |
 |------|---------------|---------|:---------:|:----:|
-| **AFAD + Proto (scale=0.5)** | 実 backbone 特徴量の class centroid 正則化 | backbone 品質・潜在空間整合 | **72.64%** | ★★ 現時点最良 |
+| **AFAD + Proto (scale=0.5)** | 実 backbone 特徴量の class centroid 正則化 | backbone 品質・潜在空間整合 | **72.64%** | ★★ 最良（scale 最適値） |
+| AFAD + Proto (scale=0.75) | 同上（過正則化） | 同上 | 71.35% | △ scale 増→悪化 |
 | **AFAD + Proto (scale=0.1)** | 同上（弱め） | 同上 | 70.08% | ✓ 70% 突破 |
 | AFAD + S-CFC | サーバーGen訓練時の cross-family consensus | z-space fragmentation（gen側） | ≈67.5% | ✓ +1.0pp |
 | AFAD + BackboneAlign | 実データ z_real → z_gen への MSE | backbone 品質 | 67.07% | ✓ +0.55pp |
@@ -668,6 +670,7 @@ Non-IID 環境（OrganAMNIST, α=0.5）での FedGen（83.97%）と AFAD Hybrid�
 | AFAD + S-CFC (γ=0.1) | ≈68.3% | ≈67.5% | — | ≈+1.0pp |
 | AFAD + Proto (scale=0.1) | 70.86% | 70.08% | 0.39% | +3.56pp |
 | **AFAD + Proto (scale=0.5)** | **73.12%** | **72.64%** | **0.25%** | **+6.12pp ★** |
+| AFAD + Proto (scale=0.75) | 71.86% | 71.35% | 0.58% | +4.83pp |
 | FedGen Only ※ | 84.66% | 83.97% | 0.76% | +17.45pp |
 
 > ※ FedGen Only は全クライアント rate=1.0（計算能力の異種性なし）。
