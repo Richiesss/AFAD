@@ -256,6 +256,7 @@ def afad_client_fn_builder(
     backbone_align_scale: float = 0.0,
     supcon_scale: float = 0.0,
     supcon_tau: float = 0.1,
+    genmix_alpha: float = 0.0,
 ):
     """Build client_fn for AFAD Hybrid (wrapped + width-scaled, KD)."""
 
@@ -307,6 +308,7 @@ def afad_client_fn_builder(
             backbone_align_scale=backbone_align_scale,
             supcon_scale=supcon_scale,
             supcon_tau=supcon_tau,
+            genmix_alpha=genmix_alpha,
         ).to_client()
 
     return client_fn
@@ -529,6 +531,7 @@ def run_single_experiment(
     s_cfc_gamma: float = 0.0,
     supcon_scale: float = 0.0,
     supcon_tau: float = 0.1,
+    genmix_alpha: float = 0.0,
 ) -> list[dict]:
     """Run one Flower simulation and return per-round metrics."""
     cid_to_model = cid_to_model or CID_TO_MODEL_P3
@@ -593,6 +596,7 @@ def run_single_experiment(
             backbone_align_scale=backbone_align_scale,
             supcon_scale=supcon_scale,
             supcon_tau=supcon_tau,
+            genmix_alpha=genmix_alpha,
         )
     elif enable_fedgen:
         # FedGen Only (rate=1.0 for all)
@@ -888,6 +892,18 @@ def main():
         "AFAD + BackboneAlign + RelKD": {
             "enable_fedgen": True, "enable_heterofl": True,
             "use_adapters": False, "backbone_align_scale": 0.1, "relkd_scale": 1.0,
+        },
+        # GenMix: task-driven generative feature mixup.
+        # z_mix = λ*z_local + (1-λ)*z_gen (λ~Beta(α,α)), CE(classifier(z_mix), y).
+        # Backbone learns via soft task gradients, adapting to sub-rate capacity
+        # without forcing exact MSE coordinate matching.
+        "AFAD + GenMix (alpha=0.2)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "genmix_alpha": 0.2,
+        },
+        "AFAD + GenMix (alpha=0.5)": {
+            "enable_fedgen": True, "enable_heterofl": True,
+            "use_adapters": False, "genmix_alpha": 0.5,
         },
         # Latent SupCon: supervised contrastive backbone alignment via InfoNCE.
         # Replaces MSE coordinate matching with angular/topological alignment:

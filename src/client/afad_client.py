@@ -93,6 +93,10 @@ class AFADClient(fl.client.NumPyClient):
             and repelled from G(y_j) for j≠i (negatives). Invariant to feature
             scale differences across heterogeneous architectures.
         supcon_tau: Temperature for InfoNCE contrastive loss (default 0.1).
+        genmix_alpha: Beta distribution parameter for GenMix (0.0 = disabled).
+            Task-driven generative feature mixup: z_mix = λ*z_local + (1-λ)*z_gen,
+            then CE(classifier(z_mix), y). Backbone learns via soft task gradients
+            rather than hard MSE coordinate matching, adapting to sub-rate capacity.
     """
 
     def __init__(
@@ -121,6 +125,7 @@ class AFADClient(fl.client.NumPyClient):
         backbone_align_scale: float = 0.0,
         supcon_scale: float = 0.0,
         supcon_tau: float = 0.1,
+        genmix_alpha: float = 0.0,
     ):
         self.cid = cid
         self.model = model
@@ -152,6 +157,7 @@ class AFADClient(fl.client.NumPyClient):
         self.backbone_align_scale = backbone_align_scale
         self.supcon_scale = supcon_scale
         self.supcon_tau = supcon_tau
+        self.genmix_alpha = genmix_alpha
 
         # Precompute label counts and available labels
         self.label_counts = self._compute_label_counts()
@@ -459,6 +465,27 @@ class AFADClient(fl.client.NumPyClient):
                         S_gen = gen_n @ gen_n.T     # [B, B]
                         relkd_loss = self.relkd_scale * F.mse_loss(S_gen, S_real)
                         loss = loss + relkd_loss
+
+                    # GenMix: task-driven generative feature mixup.
+                    # z_mix = λ*z_local + (1-λ)*z_gen, CE(classifier(z_mix), y).
+                    # Soft task gradients flow into backbone via z_local, adapting
+                    # to sub-rate capacity without forcing exact coordinate matching.
+                    if self.genmix_alpha > 0:
+                        z_local_gm = self.model.bottleneck(self.model.backbone(images))
+                        with torch.no_grad():
+                            gen_out_gm = self.generator(labels)
+                            z_gen_gm = gen_out_gm["output"]
+                            if self.family_adapter is not None:
+                                z_gen_gm = self.family_adapter(z_gen_gm)
+                        lam = float(
+                            torch.distributions.Beta(
+                                self.genmix_alpha, self.genmix_alpha
+                            ).sample()
+                        )
+                        z_mix = lam * z_local_gm + (1.0 - lam) * z_gen_gm.detach()
+                        genmix_logits = self.model.classifier(z_mix)
+                        genmix_loss = F.cross_entropy(genmix_logits, labels)
+                        loss = loss + genmix_loss
 
                     # Latent SupCon: supervised contrastive alignment of backbone features.
                     # Shifts from MSE coordinate matching to InfoNCE angular/topological
